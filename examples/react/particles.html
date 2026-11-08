@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShaderIntel React — compute particles with hooks</title>
+<link rel="stylesheet" href="../style.css">
+<!-- the bundle (React + shaderintel-react, built by tools/build-examples.mjs from src/particles.jsx)
+     imports `shaderintel`, which this map points at the library sources -->
+<script type="importmap">{ "imports": { "shaderintel": "../../src/index.js" } }</script>
+</head>
+<body>
+<div class="stage" id="root"></div>
+<script src="../common.js"></script>
+<script type="module" src="build/particles.js"></script>
+</body>
+</html>

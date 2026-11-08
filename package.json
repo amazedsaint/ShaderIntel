@@ -1,8 +1,17 @@
 {
   "name": "shaderintel",
-  "version": "0.2.0",
-  "description": "WebGPU physics (rigid bodies and joints, MLS-MPM fluids, cloth, smoke), a WGSL shader library, GPU neural networks and deterministic peer-to-peer rollback netcode, with executable correctness laws.",
-  "private": true,
+  "version": "0.3.0",
+  "description": "WebGPU physics (rigid bodies and joints, MLS-MPM fluids, cloth, smoke), a WGSL shader library, GPU neural networks and deterministic peer-to-peer rollback netcode, with executable correctness laws. Zero dependencies.",
+  "license": "MIT",
+  "author": "Anoop (https://github.com/amazedsaint)",
+  "homepage": "https://github.com/amazedsaint/ShaderIntel#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/amazedsaint/ShaderIntel.git"
+  },
+  "bugs": {
+    "url": "https://github.com/amazedsaint/ShaderIntel/issues"
+  },
   "type": "module",
   "main": "./dist/shaderintel.js",
   "module": "./src/index.js",
@@ -10,13 +19,18 @@
   "exports": {
     ".": {
       "types": "./types/shaderintel.d.ts",
-      "import": "./src/index.js"
+      "import": "./src/index.js",
+      "default": "./src/index.js"
     },
     "./bundle": {
       "types": "./types/shaderintel.d.ts",
-      "import": "./dist/shaderintel.js"
+      "import": "./dist/shaderintel.js",
+      "default": "./dist/shaderintel.js"
     },
-    "./global": "./dist/shaderintel.global.js",
+    "./global": {
+      "types": "./types/global.d.ts",
+      "default": "./dist/shaderintel.global.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -25,14 +39,33 @@
     "types",
     "LAWS.md",
     "README.md",
-    "docs"
+    "LICENSE",
+    "docs/GUIDE.md",
+    "docs/LEARNINGS.md"
+  ],
+  "sideEffects": [
+    "./src/index.js",
+    "./src/shaders/*.js",
+    "./dist/*.js"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "packages/*"
   ],
   "scripts": {
-    "build": "node tools/build.mjs",
+    "build": "node tools/build.mjs && npm run build -w shaderintel-react && node tools/build-examples.mjs",
+    "build:core": "node tools/build.mjs",
     "serve": "node tools/serve.mjs",
-    "typecheck": "tsc -p tests/types",
-    "test": "node tools/headless.mjs tests",
-    "bench": "node tools/headless.mjs bench"
+    "typecheck": "tsc -p tests/types && npm run typecheck -w shaderintel-react",
+    "test": "npm run test:unit && node tools/build-examples.mjs && node tools/headless.mjs tests && node tools/headless.mjs tests --url http://localhost:8787/packages/react/test/",
+    "test:unit": "node --test \"tests/node/*.test.mjs\"",
+    "test:gpu": "node tools/headless.mjs tests",
+    "test:react": "node tools/build-examples.mjs && node tools/headless.mjs tests --url http://localhost:8787/packages/react/test/",
+    "bench": "node tools/headless.mjs bench",
+    "thumbnails": "node tools/thumbnails.mjs",
+    "check": "npm run build && npm run typecheck && npm run test:unit"
   },
   "keywords": [
     "webgpu",
@@ -49,9 +82,19 @@
     "rollback",
     "netcode",
     "deterministic",
-    "verification"
+    "verification",
+    "react",
+    "simulation",
+    "compute-shader",
+    "sdf",
+    "raymarching"
   ],
   "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "esbuild": "^0.28.2",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
     "typescript": "^7.0.2"
   }
 }

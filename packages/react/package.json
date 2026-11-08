@@ -1,0 +1,60 @@
+{
+  "name": "shaderintel-react",
+  "version": "0.3.0",
+  "description": "React components and hooks for ShaderIntel: WebGPU rigid bodies, fluids, cloth, smoke, particles and shaders as declarative components.",
+  "license": "MIT",
+  "author": "Anoop (https://github.com/amazedsaint)",
+  "homepage": "https://github.com/amazedsaint/ShaderIntel/tree/main/packages/react#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/amazedsaint/ShaderIntel.git",
+    "directory": "packages/react"
+  },
+  "bugs": {
+    "url": "https://github.com/amazedsaint/ShaderIntel/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "node ../../node_modules/typescript/bin/tsc -p tsconfig.json",
+    "typecheck": "node ../../node_modules/typescript/bin/tsc -p tsconfig.json --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "react-dom": ">=18",
+    "shaderintel": "^0.3.0"
+  },
+  "keywords": [
+    "react",
+    "webgpu",
+    "wgsl",
+    "physics",
+    "rigid-body",
+    "fluid",
+    "mpm",
+    "cloth",
+    "smoke",
+    "particles",
+    "shaders",
+    "gpu",
+    "shaderintel"
+  ]
+}
