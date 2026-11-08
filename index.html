@@ -3,89 +3,177 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ShaderIntel — WebGPU physics + shader library</title>
-<style>
-  :root { --bg: #08090b; --card: #111419; --line: #1f252e; --ink: #e9edf2; --sub: #9aa6b4; --mute: #6b7685; --accent: #6cb6ff; }
-  * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; }
-  main { max-width: 1120px; margin: 0 auto; padding: 56px 24px 80px; }
-  h1 { font-size: 40px; line-height: 1.1; margin: 0 0 12px; letter-spacing: -0.02em; }
-  h1 span { color: var(--accent); }
-  .lede { color: var(--sub); max-width: 760px; font-size: 17px; margin: 0 0 28px; }
-  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 36px; }
-  .chip { border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px; color: var(--sub); font-size: 13px; }
-  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.12em; color: var(--mute); margin: 44px 0 14px; font-weight: 600; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
-  a.card { display: block; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 18px 16px; color: inherit; text-decoration: none; transition: border-color .15s, transform .15s; }
-  a.card:hover { border-color: #33445a; transform: translateY(-1px); }
-  .card h3 { margin: 0 0 6px; font-size: 16px; }
-  .card p { margin: 0; color: var(--sub); font-size: 13.5px; }
-  .card .tag { display: inline-block; margin-top: 10px; font: 12px ui-monospace, Menlo, monospace; color: var(--accent); }
-  pre { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; overflow-x: auto; font: 13px/1.55 ui-monospace, Menlo, monospace; color: #cdd6e0; }
-  .k { color: #ff9e64; } .s { color: #9ece6a; } .c { color: var(--mute); }
-  footer { margin-top: 48px; color: var(--mute); font-size: 13px; }
-  .warn { display: none; background: #2a1414; border: 1px solid #5a2a2a; color: #ffb4a9; padding: 10px 14px; border-radius: 8px; margin-bottom: 20px; }
-</style>
+<title>ShaderIntel — WebGPU physics, fluids and shaders for the browser</title>
+<meta name="description" content="A zero-dependency WebGPU library: rigid bodies and joints, MLS-MPM fluids, cloth, smoke, a WGSL shader library, GPU neural networks and rollback netcode, for plain JavaScript and React.">
+<meta name="theme-color" content="#15181d">
+<meta property="og:title" content="ShaderIntel">
+<meta property="og:description" content="WebGPU physics, fluids and shaders for the browser, with every promise checked by an executable law.">
+<meta property="og:image" content="site/hero.jpg">
+<link rel="icon" href="site/mark.svg" type="image/svg+xml">
+<link rel="preload" href="site/fonts/archivo-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="site/site.css">
+<link rel="stylesheet" href="site/home.css">
 </head>
 <body>
-<main>
-  <div class="warn" id="warn">This browser has no WebGPU. Use Chrome / Edge 113+, Safari 26+ or Firefox 141+ (Windows), from <code>http://localhost</code> or https.</div>
-  <h1>Shader<span>Intel</span></h1>
-  <p class="lede">A zero-dependency WebGPU library for GPU physics, shaders, neural networks and peer-to-peer games, built
-    from first principles: rigid bodies and joints (AVBD), lattice-unit MLS-MPM coupled two-way with rigid bodies, XPBD cloth,
-    Eulerian smoke, N-body gravity, boids, GPU matrix multiply and MLPs, deterministic worlds with rollback netcode, a WGSL
-    shader library (noise with analytic gradients, SDFs, cone-marched ray marching, PBR, colour science), executable laws that
-    check all of it, and a tiny SDK that writes the WebGPU boilerplate for you.</p>
-  <div class="chips">
-    <span class="chip">0 dependencies · plain ES modules</span><span class="chip">subgroup-accelerated primitives</span>
-    <span class="chip">autotuned kernels</span><span class="chip">verified benchmarks vs. common baselines</span>
-    <span class="chip">deterministic by construction</span><span class="chip">every promise an executable law</span>
-  </div>
+<div class="shell">
+  <aside class="side" id="side">
+    <div class="head">
+      <a class="wordmark" href="./" aria-label="ShaderIntel home">
+        <svg width="36" height="22" viewBox="0 0 36 22" aria-hidden="true"><defs><linearGradient id="turbo" x1="0" x2="1">
+          <stop offset="0" stop-color="#4662d7"/><stop offset=".3" stop-color="#36aaf9"/><stop offset=".5" stop-color="#1ae4b6"/>
+          <stop offset=".7" stop-color="#c8ef34"/><stop offset=".85" stop-color="#faba39"/><stop offset="1" stop-color="#f66b19"/></linearGradient></defs>
+          <path d="M1 20 Q6 20 12 12 Q18 4 24 12 Q30 20 35 20" fill="none" stroke="url(#turbo)" stroke-width="3" stroke-linecap="round"/>
+          <circle cx="18" cy="8" r="2.4" fill="#e8ebef"/></svg>
+        <span>ShaderIntel</span>
+      </a>
+      <button class="btn small menu-btn" type="button" aria-expanded="false" aria-controls="side">Menu</button>
+    </div>
+    <p class="about">WebGPU physics, fluids and shaders for the browser. Plain JavaScript or React, zero dependencies.</p>
+    <nav aria-label="Site">
+      <ul class="nav">
+        <li><a href="examples/">Examples<small>Live demos with their source</small></a></li>
+        <li><a href="docs/?page=guide">Guide<small>The API and the math behind each solver</small></a></li>
+        <li><a href="docs/?page=react">React<small>Components and hooks</small></a></li>
+        <li><a href="docs/?page=laws">Laws<small>What the library promises, and how it's checked</small></a></li>
+        <li><a href="examples/#bench">Benchmarks<small>Run them on your GPU</small></a></li>
+        <li><a href="docs/?page=learnings">Learnings<small>What we measured, and what didn't work</small></a></li>
+        <li><a href="https://github.com/amazedsaint/ShaderIntel">GitHub</a></li>
+      </ul>
+    </nav>
+    <div class="install">
+      <pre>npm install shaderintel</pre>
+      <pre>npm install shaderintel-react</pre>
+    </div>
+    <p class="foot">MIT licensed. Version 0.3.0.<br>Needs WebGPU: Chrome and Edge 113+, Safari 26+, Firefox 141+ on Windows.</p>
+  </aside>
 
-  <pre><span class="k">import</span> * <span class="k">as</span> SI <span class="k">from</span> <span class="s">'./src/index.js'</span>;
-<span class="k">const</span> gpu  = <span class="k">await</span> SI.init();
-<span class="k">const</span> view = gpu.view(<span class="s">'#canvas'</span>, { bloom: <span class="k">true</span>, hud: <span class="k">true</span> });
-<span class="k">const</span> pos  = gpu.array(<span class="s">'vec4f'</span>, 1_000_000);                       <span class="c">// typed GPU array</span>
-<span class="k">const</span> flow = gpu.kernel({ imports: [<span class="s">'noise'</span>], buffers: { pos }, uniforms: { dt: <span class="s">'f32'</span> },
-  code: <span class="s">`pos[i] += vec4f(curl3(pos[i].xyz) * u.dt, 0.0);`</span> });           <span class="c">// just the body</span>
+  <main>
+    <section class="hero" aria-labelledby="hero-title">
+      <canvas id="hero-canvas" aria-label="A live simulation: water with floating crates. Move the pointer through it to stir the water."></canvas>
+      <img class="poster" id="hero-poster" src="site/hero.jpg" alt="Water with floating crates, rendered by ShaderIntel" hidden>
+      <div class="hero-copy">
+        <h1 id="hero-title">Physics and shaders on the GPU, in your browser.</h1>
+        <p class="lede">Rigid bodies and joints, fluids that push them around, cloth, smoke, a WGSL shader library, neural networks and rollback netcode.</p>
+        <div class="cta">
+          <a class="btn primary" href="examples/">Browse the examples</a>
+          <a class="btn" href="docs/?page=guide">Read the guide</a>
+        </div>
+      </div>
+      <p class="hero-status" id="hero-status" aria-live="polite"></p>
+    </section>
+
+    <section class="block" aria-labelledby="examples-title">
+      <div class="block-head">
+        <h2 id="examples-title">Examples</h2>
+        <a href="examples/">Open the example browser</a>
+      </div>
+      <div class="mosaic" id="mosaic"><noscript><a href="examples/">See the examples</a></noscript></div>
+    </section>
+
+    <section class="block" aria-labelledby="start-title">
+      <div class="block-head">
+        <h2 id="start-title">Start in ten lines</h2>
+        <a href="docs/?page=guide#1-core-sdk">The SDK in detail</a>
+      </div>
+      <p class="text">Write the body of a compute shader; ShaderIntel generates the bindings, a byte-exact uniform struct, the dispatch and the frame loop. Or describe a scene in React and let components own the GPU memory.</p>
+      <div class="pair">
+        <figure class="code">
+          <header><span>Plain JavaScript</span><button class="btn small copy" type="button">Copy</button></header>
+<pre data-lang="js">import * as SI from 'shaderintel';
+
+const gpu  = await SI.init();
+const view = gpu.view('#canvas', { bloom: true });
+const pos  = gpu.array('vec4f', 1_000_000);
+
+gpu.kernel({ imports: ['hash'], buffers: { pos },
+  code: `var s = rngSeed(i, 1u); pos[i] = vec4f(randBall(&amp;s), 1.0);` }).run(1_000_000);
+
+const flow = gpu.kernel({ imports: ['noise'], buffers: { pos }, uniforms: { dt: 'f32' },
+  code: `pos[i] += vec4f(curl3(pos[i].xyz) * u.dt, 0.0);` });
+
 view.add(gpu.points({ data: pos }));
 view.run(({ dt }) =&gt; flow.run(1_000_000, { dt }));</pre>
+        </figure>
+        <figure class="code">
+          <header><span>React</span><button class="btn small copy" type="button">Copy</button></header>
+<pre data-lang="jsx">import { Canvas, Stage, Physics, Box, Sphere } from 'shaderintel-react';
 
-  <h2>Physics</h2>
-  <div class="grid">
-    <a class="card" href="examples/mpm.html"><h3>MLS-MPM: water, jelly, snow, sand</h3><p>One solver, four constitutive models, lattice units, shared-memory tiled P2G, screen-space water surface.</p><span class="tag">physics/mpm.js</span></a>
-    <a class="card" href="examples/rigid.html"><h3>Rigid bodies (AVBD)</h3><p>Boxes, spheres and capsules: per-body Newton steps in graph colours, augmented-Lagrangian contacts, Coulomb friction. Pyramids that stand, walls that break, a 6,000-body pile in 4.3 ms.</p><span class="tag">physics/rigid.js</span></a>
-    <a class="card" href="examples/joints.html"><h3>Joints, ragdolls &amp; machines</h3><p>Ball, hinge, weld, rope and slider joints with limits, motors and break forces: ragdolls on stairs, a rope bridge, a car, a wrecking ball.</p><span class="tag">physics/rigid.js</span></a>
-    <a class="card" href="examples/coupling.html"><h3>Bodies in water &amp; sand</h3><p>Two-way coupling: rigid bodies are moving boundaries of the MPM grid and get back the momentum the fluid loses. Floating, sinking and splashing are not scripted.</p><span class="tag">physics/coupling.js</span></a>
-    <a class="card" href="examples/cloth.html"><h3>XPBD cloth</h3><p>Small steps, graph-coloured Gauss–Seidel, compliance-based materials, wind and colliders.</p><span class="tag">physics/cloth.js</span></a>
-    <a class="card" href="examples/smoke.html"><h3>3D smoke &amp; fire</h3><p>Eulerian grid on 3D textures, vorticity confinement, red–black SOR projection, volumetric lighting.</p><span class="tag">physics/smoke.js</span></a>
-    <a class="card" href="examples/nbody.html"><h3>Galaxy collision (N-body)</h3><p>Direct O(N²) gravity, autotuned per GPU: shared-memory tiles, register blocking, subgroups.</p><span class="tag">physics/nbody.js</span></a>
-    <a class="card" href="examples/boids.html"><h3>Boids at scale</h3><p>130k–1M flocking agents via a counting-sort neighbour grid, re-sorted every frame.</p><span class="tag">physics/boids.js</span></a>
-    <a class="card" href="examples/quickstart.html"><h3>Quickstart: 1M curl-noise particles</h3><p>The whole SDK in 30 lines: arrays, kernels, shader-library imports, a renderer.</p><span class="tag">examples/quickstart.html</span></a>
-  </div>
+export function Scene() {
+  return (
+    &lt;Canvas camera={{ target: [0, 1, 0], distance: 8 }} hud&gt;
+      &lt;Stage /&gt;
+      &lt;Physics&gt;
+        &lt;Box position={[0, 4, 0]} size={[1, 1, 1]} /&gt;
+        &lt;Sphere position={[0.2, 7, 0]} radius={0.5} /&gt;
+      &lt;/Physics&gt;
+    &lt;/Canvas&gt;
+  );
+}</pre>
+        </figure>
+      </div>
+    </section>
 
-  <h2>Games &amp; learning</h2>
-  <div class="grid">
-    <a class="card" href="examples/p2p.html"><h3>Peer-to-peer rollback netcode</h3><p>Two peers with their own GPU worlds over a lossy network: input delay, prediction, rollback through GPU snapshots, matching 64-bit state hashes.</p><span class="tag">net/</span></a>
-    <a class="card" href="examples/neural.html"><h3>Neural field on the GPU</h3><p>An MLP with Fourier features learns an image: autotuned GEMM, backprop and Adam, training and inference every frame.</p><span class="tag">nn/</span></a>
-    <a class="card" href="examples/three.html"><h3>three.js renders the physics</h3><p>ShaderIntel bodies drawn by three.js with shadows and materials on the same GPU device, poses copied GPU to GPU. Loads three.js from a CDN.</p><span class="tag">interop/three.js</span></a>
-  </div>
+    <section class="block" aria-labelledby="inside-title">
+      <div class="block-head"><h2 id="inside-title">What's inside</h2></div>
+      <dl class="inside">
+        <div><dt>Rigid bodies and joints</dt><dd>Boxes, spheres and capsules with ball, hinge, weld, rope and slider joints, motors, limits and break forces, solved with Augmented Vertex Block Descent.</dd></div>
+        <div><dt>Fluids and soft matter</dt><dd>MLS-MPM water, honey, jelly, rubber, snow and sand that rigid bodies float, sink and splash in.</dd></div>
+        <div><dt>Cloth and smoke</dt><dd>XPBD cloth with wind and colliders; smoke and fire on a staggered 3D grid with volumetric light.</dd></div>
+        <div><dt>Particles and agents</dt><dd>Direct N-body gravity autotuned per GPU, a million boids, counting-sort neighbour grids.</dd></div>
+        <div><dt>Shader library</dt><dd>Noise with analytic gradients, signed distance fields, cone-marched ray marching, PBR, OKLab and scientific colormaps.</dd></div>
+        <div><dt>Neural networks</dt><dd>Autotuned GEMM, MLPs with backprop and Adam, evolution strategies for thousands of agents at once.</dd></div>
+        <div><dt>Multiplayer that stays in sync</dt><dd>Bit-identical worlds, GPU snapshots, rollback netcode over WebRTC and match transcripts anyone can re-verify.</dd></div>
+        <div><dt>React</dt><dd>&lt;Canvas&gt;, &lt;Physics&gt;, &lt;Fluid&gt;, &lt;Cloth&gt; and hooks that tie GPU memory to a component's life.</dd></div>
+      </dl>
+    </section>
 
-  <h2>Shaders</h2>
-  <div class="grid">
-    <a class="card" href="examples/sdf.html"><h3>SDF scene, cone-marched</h3><p>Write only <code>map()</code>; get two-pass cone marching, soft shadows, AO and PBR.</p><span class="tag">render/sdf.js</span></a>
-    <a class="card" href="examples/noise.html"><h3>Procedural noise gallery</h3><p>Domain warping, terrain with analytic normals, Worley, ridged, curl flow, fire, marble.</p><span class="tag">shaders/noise.js</span></a>
-  </div>
+    <section class="block" aria-labelledby="bench-title">
+      <div class="block-head">
+        <h2 id="bench-title">Measured against what most code does</h2>
+        <a href="examples/#bench">Run the benchmarks</a>
+      </div>
+      <p class="text">Each kernel runs beside the common approach on the same GPU and inputs, and the two results must agree before either is timed. Speed-ups on an Apple M2 Max and an NVIDIA GB10.</p>
+      <div class="table-wrap">
+        <table class="bench">
+          <thead><tr><th scope="col">Task</th><th scope="col">Compared with</th><th scope="col" class="num">M2 Max</th><th scope="col" class="num">GB10</th></tr></thead>
+          <tbody>
+            <tr><td>Fixed-radius neighbours, 65,536 points</td><td>All pairs, as in the WebGPU compute-boids sample</td><td class="num">197×</td><td class="num">27×</td></tr>
+            <tr><td>Matrix multiply, 2048³</td><td>16×16 shared-memory tiles</td><td class="num">2.3×</td><td class="num">4.7×</td></tr>
+            <tr><td>MPM particle-to-grid, 262,144 particles</td><td>Unsorted global atomics</td><td class="num">3.1×</td><td class="num">2.9×</td></tr>
+            <tr><td>SDF ray marching, 1080p</td><td>Per-pixel sphere tracing</td><td class="num">2.5×</td><td class="num">1.5×</td></tr>
+            <tr><td>Prefix sum, 16M values</td><td>Blelloch scan (GPU Gems 3)</td><td class="num">2.3×</td><td class="num">1.3×</td></tr>
+            <tr><td>N-body gravity, 65,536 bodies</td><td>One thread per body</td><td class="num">1.49×</td><td class="num">1.34×</td></tr>
+            <tr><td>3D simplex noise, 16M samples</td><td>Ashima webgl-noise</td><td class="num">1.32×</td><td class="num">1.21×</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
 
-  <h2>Proof</h2>
-  <div class="grid">
-    <a class="card" href="bench/index.html"><h3>Benchmarks</h3><p>Each kernel vs. the technique most code uses today, on your GPU, with result verification.</p><span class="tag">bench/</span></a>
-    <a class="card" href="tests/index.html"><h3>Test suite</h3><p>Primitives against CPU references, conservation laws, friction, joints, rolling, buoyancy, backprop, two peers over a lossy network.</p><span class="tag">tests/</span></a>
-    <a class="card" href="LAWS.md"><h3>Laws</h3><p>Everything the library promises, each with a small independent checker: exact, probabilistic with a bound, or physical with a tolerance.</p><span class="tag">LAWS.md</span></a>
-    <a class="card" href="docs/GUIDE.md"><h3>Guide &amp; math</h3><p>API reference, the first-principles derivations, and every lesson learned while building it.</p><span class="tag">docs/</span></a>
-  </div>
-  <footer>Run locally with <code>node tools/serve.mjs</code> and open <code>http://localhost:8787/</code>.</footer>
-</main>
-<script>if (!navigator.gpu) document.getElementById('warn').style.display = 'block';</script>
+    <section class="block" aria-labelledby="laws-title">
+      <div class="block-head">
+        <h2 id="laws-title">Promises you can check</h2>
+        <a href="docs/?page=laws">All the laws</a>
+      </div>
+      <p class="text">What the library promises is written down as laws, and each law has a small checker that shares no code with what it judges. The test suite runs every one of them.</p>
+      <div class="table-wrap">
+        <table class="laws">
+          <thead><tr><th scope="col">Law</th><th scope="col">Statement</th><th scope="col">Kind of check</th></tr></thead>
+          <tbody>
+            <tr><td>Determinism</td><td>The same inputs give a bit-identical world: equal 64-bit state hashes, run after run.</td><td>Exact</td></tr>
+            <tr><td>Conservation</td><td>Particle-to-grid transfer conserves mass and momentum.</td><td>Exact to 2⁻²² fixed point</td></tr>
+            <tr><td>Matrix multiply</td><td>C = A·B, certified by Freivalds' algorithm before any timing.</td><td>Probabilistic, false accept ≤ 2⁻⁸</td></tr>
+            <tr><td>Friction</td><td>Contact forces push and stay inside the Coulomb cone.</td><td>Exact sign and cone</td></tr>
+            <tr><td>Replay</td><td>Restoring a snapshot and replaying the inputs reproduces the state.</td><td>Exact</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <footer class="page-foot">
+      <p>ShaderIntel is MIT licensed. The source, issues and releases are on <a href="https://github.com/amazedsaint/ShaderIntel">GitHub</a>.</p>
+    </footer>
+  </main>
+</div>
+<script type="module" src="site/home.js"></script>
 </body>
 </html>

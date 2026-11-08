@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Examples — ShaderIntel</title>
+<meta name="description" content="Live WebGPU examples of ShaderIntel: rigid bodies and joints, fluids, cloth, smoke, particles, shaders, neural networks, netcode and React, each with its source.">
+<meta name="theme-color" content="#15181d">
+<link rel="icon" href="../site/mark.svg" type="image/svg+xml">
+<link rel="preload" href="../site/fonts/archivo-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="../site/site.css">
+<link rel="stylesheet" href="../site/examples.css">
+</head>
+<body>
+<div class="browser">
+  <aside class="side" id="side">
+    <div class="head">
+      <a class="wordmark" href="../" aria-label="ShaderIntel home">
+        <svg width="36" height="22" viewBox="0 0 36 22" aria-hidden="true"><defs><linearGradient id="turbo" x1="0" x2="1">
+          <stop offset="0" stop-color="#4662d7"/><stop offset=".3" stop-color="#36aaf9"/><stop offset=".5" stop-color="#1ae4b6"/>
+          <stop offset=".7" stop-color="#c8ef34"/><stop offset=".85" stop-color="#faba39"/><stop offset="1" stop-color="#f66b19"/></linearGradient></defs>
+          <path d="M1 20 Q6 20 12 12 Q18 4 24 12 Q30 20 35 20" fill="none" stroke="url(#turbo)" stroke-width="3" stroke-linecap="round"/>
+          <circle cx="18" cy="8" r="2.4" fill="#e8ebef"/></svg>
+        <span>ShaderIntel</span>
+      </a>
+      <button class="btn small menu-btn" type="button" aria-expanded="false" aria-controls="side">Menu</button>
+    </div>
+    <label class="filter">
+      <span class="visually-hidden">Filter examples</span>
+      <input type="search" id="filter" placeholder="Filter: fluid, joints, react…" autocomplete="off" spellcheck="false">
+    </label>
+    <nav class="list" id="list" aria-label="Examples"></nav>
+    <p class="foot"><a href="../">Home</a><span aria-hidden="true">, </span><a href="../docs/?page=guide">Guide</a><span aria-hidden="true">, </span><a href="https://github.com/amazedsaint/ShaderIntel">GitHub</a></p>
+  </aside>
+
+  <main class="viewer">
+    <header class="bar">
+      <div class="what">
+        <h1 id="title">Examples</h1>
+        <p id="desc"></p>
+      </div>
+      <div class="actions">
+        <button class="btn small" type="button" id="show-source" aria-expanded="false" aria-controls="source">View source</button>
+        <a class="btn small" id="open-tab" href="#" target="_blank" rel="noopener">Open in a new tab</a>
+      </div>
+    </header>
+    <div class="stage">
+      <iframe id="frame" title="Example" allow="fullscreen; clipboard-write" loading="eager"></iframe>
+      <section class="source" id="source" hidden aria-label="Source code">
+        <header>
+          <code id="source-path"></code>
+          <div>
+            <button class="btn small copy-src" type="button">Copy</button>
+            <button class="btn small" type="button" id="close-source">Close</button>
+          </div>
+        </header>
+        <pre id="source-code" tabindex="0"></pre>
+      </section>
+    </div>
+  </main>
+</div>
+<script type="module" src="../site/examples.js"></script>
+</body>
+</html>

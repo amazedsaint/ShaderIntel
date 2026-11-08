@@ -1,0 +1,66 @@
+{
+  "categories": [
+    {
+      "name": "Rigid bodies",
+      "examples": [
+        { "id": "rigid", "path": "rigid.html", "title": "Pyramids, walls and piles", "description": "A 210-box pyramid, a brick wall hit by a cannonball and a 6,000-body pile, solved with Augmented Vertex Block Descent.", "tags": ["physics", "avbd", "boxes", "stacking", "friction"], "featured": 2 },
+        { "id": "joints", "path": "joints.html", "title": "Joints, ragdolls and machines", "description": "Ragdolls tumbling down stairs, a rope bridge, motorised machines and a wrecking ball through a breakable wall.", "tags": ["physics", "hinge", "motor", "rope", "ragdoll"], "featured": 3 },
+        { "id": "p2p", "path": "p2p.html", "title": "Rollback netcode", "description": "Two players with their own GPU worlds over a lossy network: prediction, rollback through GPU snapshots and matching 64-bit state hashes.", "tags": ["networking", "deterministic", "multiplayer", "webrtc"], "featured": 11 }
+      ]
+    },
+    {
+      "name": "Fluids, cloth and smoke",
+      "examples": [
+        { "id": "coupling", "path": "coupling.html", "title": "Bodies in water and sand", "description": "Crates float, sink and splash in MLS-MPM water; a dam break against crates; balls dropped into sand.", "tags": ["mpm", "fluid", "buoyancy", "coupling"], "featured": 1 },
+        { "id": "mpm", "path": "mpm.html", "title": "Water, jelly, snow and sand", "description": "One MLS-MPM solver, four constitutive models, a screen-space water surface. Alt-drag to push the fluid with a ball.", "tags": ["mpm", "fluid", "snow", "sand", "elastic"], "featured": 4 },
+        { "id": "cloth", "path": "cloth.html", "title": "Cloth in the wind", "description": "XPBD cloth with graph-coloured constraints, gusty wind and sphere and box colliders.", "tags": ["xpbd", "cloth", "wind"], "featured": 6 },
+        { "id": "smoke", "path": "smoke.html", "title": "Smoke and fire", "description": "Eulerian smoke on a staggered 3D grid with vorticity confinement and volumetric light.", "tags": ["fluid", "smoke", "fire", "volume"], "featured": 7 }
+      ]
+    },
+    {
+      "name": "Particles and agents",
+      "examples": [
+        { "id": "quickstart", "path": "quickstart.html", "title": "A million particles", "description": "The whole SDK in 30 lines: one million particles advected through divergence-free curl noise.", "tags": ["particles", "curl noise", "kernel", "quickstart"], "featured": 5 },
+        { "id": "nbody", "path": "nbody.html", "title": "Colliding galaxies", "description": "65,536 bodies of direct O(N²) gravity, with the kernel autotuned for your GPU.", "tags": ["gravity", "n-body", "autotune"], "featured": 8 },
+        { "id": "boids", "path": "boids.html", "title": "A flock of 131,072", "description": "Separation, alignment and cohesion through a GPU neighbour grid, re-sorted every frame. Up to a million boids.", "tags": ["boids", "flocking", "agents", "grid"], "featured": 9 }
+      ]
+    },
+    {
+      "name": "Shaders",
+      "examples": [
+        { "id": "sdf", "path": "sdf.html", "title": "A scene from one function", "description": "Write map(); get two-pass cone marching, soft shadows, ambient occlusion and PBR.", "tags": ["sdf", "raymarching", "wgsl", "pbr"], "featured": 10 },
+        { "id": "noise", "path": "noise.html", "title": "Procedural noise", "description": "Domain warping, terrain lit by analytic noise gradients, Worley cells, curl flow and fire.", "tags": ["noise", "simplex", "worley", "fbm"] }
+      ]
+    },
+    {
+      "name": "Neural networks",
+      "examples": [
+        { "id": "neural", "path": "neural.html", "title": "A network learns an image", "description": "An MLP with Fourier features trains on an image and redraws it every frame: autotuned GEMM, backprop and Adam on the GPU.", "tags": ["neural", "mlp", "gemm", "training"], "featured": 12 }
+      ]
+    },
+    {
+      "name": "React",
+      "examples": [
+        { "id": "react-physics", "path": "react/physics.html", "source": "react/src/physics.jsx", "title": "Physics playground", "description": "Boxes, chain links and joints are components; React state sets gravity and solver iterations live.", "tags": ["react", "physics", "joints", "components"], "featured": 13 },
+        { "id": "react-fluid", "path": "react/fluid.html", "source": "react/src/fluid.jsx", "title": "Fluid and crates", "description": "<Fluid> inside <Physics> couples automatically; pick the material from a select and the fluid restarts.", "tags": ["react", "mpm", "fluid", "coupling"] },
+        { "id": "react-shader", "path": "react/shader.html", "source": "react/src/shader.jsx", "title": "Live shader editor", "description": "Edit an SDF scene's map() and apply it: the new code is compiled off-screen and swapped in only if it compiles.", "tags": ["react", "sdf", "wgsl", "editor"] },
+        { "id": "react-particles", "path": "react/particles.html", "source": "react/src/particles.jsx", "title": "Compute with hooks", "description": "useArray, useKernel and useFrame: your own WGSL compute kernel running inside a component.", "tags": ["react", "hooks", "kernel", "particles"] },
+        { "id": "react-sims", "path": "react/sims.html", "source": "react/src/sims.jsx", "title": "Simulations as components", "description": "Cloth, smoke, boids and galaxies; switching unmounts one, freeing its GPU memory, and mounts the next.", "tags": ["react", "cloth", "smoke", "boids", "n-body"] }
+      ]
+    },
+    {
+      "name": "Interop",
+      "examples": [
+        { "id": "three", "path": "three.html", "title": "Drawn by three.js", "description": "ShaderIntel physics rendered by three.js with shadows and materials on the same GPU device. Loads three.js from a CDN.", "tags": ["three.js", "interop", "tsl", "shadows"], "wait": 8 }
+      ]
+    },
+    {
+      "name": "Verification",
+      "examples": [
+        { "id": "bench", "path": "../bench/index.html", "title": "Benchmarks", "description": "Each kernel against the technique most code uses today, on your GPU, with the results checked before anything is timed.", "tags": ["benchmark", "performance"], "heavy": true },
+        { "id": "tests", "path": "../tests/index.html", "title": "Test suite", "description": "Primitives against CPU references, conservation laws, friction, joints, buoyancy, backprop and every law in LAWS.md. Runs about 30 s of GPU work.", "tags": ["tests", "laws", "verification"], "heavy": true },
+        { "id": "react-tests", "path": "../packages/react/test/index.html", "title": "React test suite", "description": "shaderintel-react mounted for real (StrictMode included) on your GPU.", "tags": ["tests", "react"], "heavy": true }
+      ]
+    }
+  ]
+}

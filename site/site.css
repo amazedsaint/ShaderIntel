@@ -1,0 +1,94 @@
+/* ShaderIntel site: home, examples browser and docs share these tokens and the sidebar shell.
+   Slate surfaces match the demos' own stage; the two accents come from the turbo colormap the
+   shader library ships: cyan marks what you can interact with, amber marks measured numbers. */
+
+@font-face {
+  font-family: 'Archivo';
+  src: url('fonts/archivo-latin.woff2') format('woff2');
+  font-weight: 100 900;
+  font-stretch: 62% 125%;
+  font-display: swap;
+}
+
+:root {
+  --bg: #1b1f25;          /* page */
+  --side: #15181d;        /* sidebar, code */
+  --raised: #262b33;      /* hover, inputs */
+  --rule: #353b45;
+  --ink: #e8ebef;
+  --ink-2: #a3acb8;
+  --ink-3: #79838f;
+  --cyan: #4fd3f0;        /* interactive */
+  --amber: #f6b44a;       /* measurements */
+  --turbo: linear-gradient(90deg, #30123b, #4662d7, #36aaf9, #1ae4b6, #72fe5e, #c8ef34, #faba39, #f66b19, #ca2a04);
+  --side-w: 296px;
+  --font: 'Archivo', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --mono: ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }   /* component display rules must not resurrect hidden elements */
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 400 16px/1.55 var(--font); font-stretch: 100%; }
+a { color: var(--cyan); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+a:hover { color: #8fe4f7; }
+:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; border-radius: 2px; }
+img { display: block; max-width: 100%; }
+code, pre, kbd { font-family: var(--mono); }
+code { font-size: 0.88em; background: var(--raised); padding: 0.1em 0.35em; border-radius: 4px; }
+pre { margin: 0; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+/* ---------------------------------------------------------------- wordmark */
+.wordmark { display: flex; align-items: center; gap: 10px; color: var(--ink); text-decoration: none; }
+.wordmark svg { flex: none; }
+.wordmark span { font-size: 23px; line-height: 1; font-weight: 850; font-stretch: 125%; letter-spacing: -0.01em; }
+.wordmark:hover { color: #fff; }
+
+/* ---------------------------------------------------------------- sidebar shell */
+.shell { display: grid; grid-template-columns: var(--side-w) minmax(0, 1fr); min-height: 100vh; }
+.side { position: sticky; top: 0; height: 100vh; overflow-y: auto; background: var(--side); border-right: 1px solid var(--rule);
+  padding: 26px 22px 24px; display: flex; flex-direction: column; gap: 22px; }
+.side .about { margin: 0; color: var(--ink-2); font-size: 14.5px; line-height: 1.5; }
+.nav { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.nav a { display: block; padding: 7px 10px; margin: 0 -10px; border-radius: 6px; color: var(--ink); text-decoration: none; font-size: 15px; }
+.nav a:hover { background: var(--raised); color: #fff; }
+.nav a[aria-current="page"] { background: var(--raised); box-shadow: inset 2px 0 0 var(--cyan); }
+.nav small { display: block; color: var(--ink-3); font-size: 12.5px; line-height: 1.35; }
+.install { display: grid; gap: 6px; }
+.install pre { position: relative; background: #0f1215; border: 1px solid var(--rule); border-radius: 6px; padding: 8px 10px;
+  font-size: 12.5px; color: var(--ink-2); overflow-x: auto; }
+.install pre::before { content: '$ '; color: var(--ink-3); }
+.side .foot { margin-top: auto; color: var(--ink-3); font-size: 12.5px; line-height: 1.5; }
+.side .foot a { color: var(--ink-2); }
+.side .menu-btn { display: none; }
+
+/* ---------------------------------------------------------------- buttons */
+.btn { display: inline-flex; align-items: center; gap: 8px; padding: 10px 16px; border-radius: 7px; border: 1px solid var(--rule);
+  background: var(--raised); color: var(--ink); font: 500 15px/1.2 var(--font); text-decoration: none; cursor: pointer; }
+.btn:hover { background: #2f3540; color: #fff; }
+.btn.primary { background: var(--cyan); border-color: var(--cyan); color: #0b1a20; font-weight: 650; }
+.btn.primary:hover { background: #7fe0f5; color: #0b1a20; }
+.btn.small { padding: 6px 10px; font-size: 13px; border-radius: 6px; }
+
+/* ---------------------------------------------------------------- code */
+.code { background: var(--side); border: 1px solid var(--rule); border-radius: 8px; overflow: hidden; }
+.code header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 10px 8px 14px;
+  border-bottom: 1px solid var(--rule); color: var(--ink-2); font-size: 13.5px; }
+.code pre { padding: 14px 16px; overflow-x: auto; font-size: 13px; line-height: 1.6; color: #d6dde6; tab-size: 2; }
+.hl-k { color: #ff9e64; } .hl-s { color: #a8d982; } .hl-c { color: #6c7684; font-style: italic; } .hl-n { color: #f6b44a; }
+.hl-f { color: #7cc8ff; } .hl-t { color: #c9a5ff; } .hl-tag { color: #ff8b8b; } .hl-attr { color: #ffd38a; }
+
+/* ---------------------------------------------------------------- narrow screens: the sidebar becomes a top bar */
+@media (max-width: 860px) {
+  .shell { grid-template-columns: 1fr; }
+  .side { position: sticky; z-index: 30; height: auto; max-height: 100vh; padding: 14px 18px; gap: 16px; border-right: 0; border-bottom: 1px solid var(--rule); }
+  .side .head { display: flex; align-items: center; justify-content: space-between; }
+  .side .menu-btn { display: inline-flex; }
+  .side:not(.open) > :not(.head) { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
+}

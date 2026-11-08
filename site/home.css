@@ -1,0 +1,77 @@
+/* Home: the live hero, the example mosaic and the reference sections. */
+
+/* ---------------------------------------------------------------- hero */
+.hero { position: relative; height: min(80vh, 780px); min-height: 480px; background: #232830; overflow: hidden; isolation: isolate; }
+.hero canvas, .hero .poster { position: absolute; inset: 0; width: 100%; height: 100%; display: block; object-fit: cover; }
+.hero canvas { cursor: crosshair; }
+/* legibility scrim under the copy only: the simulation stays untouched above it */
+.hero::after { content: ''; position: absolute; inset: auto 0 0 0; height: 62%; z-index: 1; pointer-events: none;
+  background: linear-gradient(to top, rgba(14, 17, 21, 0.92) 0%, rgba(14, 17, 21, 0.55) 45%, rgba(14, 17, 21, 0) 100%); }
+.hero-copy { position: absolute; z-index: 2; left: clamp(20px, 4vw, 56px); right: clamp(20px, 4vw, 56px); bottom: clamp(28px, 6vh, 64px);
+  max-width: 900px; pointer-events: none; }
+.hero-copy .cta { pointer-events: auto; }
+.hero h1 { margin: 0; font-size: clamp(38px, 5.6vw, 72px); line-height: 0.98; font-weight: 870; font-stretch: 125%; letter-spacing: -0.025em;
+  max-width: 14ch; color: #fff; text-wrap: balance; }
+.hero .lede { margin: 18px 0 26px; max-width: 52ch; font-size: clamp(16px, 1.45vw, 19px); line-height: 1.5; color: #d3d9e0; }
+.cta { display: flex; flex-wrap: wrap; gap: 10px; }
+.hero-status { position: absolute; z-index: 2; right: clamp(16px, 2.5vw, 28px); top: 18px; margin: 0; max-width: 40ch; text-align: right;
+  font-size: 13px; line-height: 1.45; color: #c6ced8; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6); }
+.hero-status:empty { display: none; }
+.hero-status b { color: #fff; font-weight: 600; }
+.hero-status .live { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--cyan); margin-right: 7px; vertical-align: 1px; }
+.hero-status button { pointer-events: auto; margin-top: 8px; }
+
+/* ---------------------------------------------------------------- sections */
+main { min-width: 0; }
+.block { padding: 64px clamp(20px, 4vw, 56px) 8px; max-width: 1280px; }
+.block-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 18px; }
+.block-head h2 { margin: 0; font-size: clamp(26px, 2.6vw, 34px); line-height: 1.1; font-weight: 760; font-stretch: 118%; letter-spacing: -0.015em; }
+.block-head a { font-size: 15px; }
+.text { margin: 0 0 22px; max-width: 70ch; color: var(--ink-2); font-size: 16.5px; }
+
+/* ---------------------------------------------------------------- mosaic: real screenshots, no card chrome */
+/* 13 tiles with a 2×2 lead fill whole rows at 4 and 2 columns; at 3 columns the last tile steps out */
+.mosaic { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); grid-auto-flow: dense; gap: 3px;
+  margin: 0 calc(-1 * clamp(20px, 4vw, 56px)); }
+@media (max-width: 1240px) { .mosaic { grid-template-columns: repeat(3, minmax(0, 1fr)); } .mosaic .tile:nth-child(13) { display: none; } }
+@media (max-width: 900px) { .mosaic { grid-template-columns: repeat(2, minmax(0, 1fr)); } .mosaic .tile:nth-child(13) { display: block; } }
+.tile { position: relative; display: block; aspect-ratio: 16 / 10; overflow: hidden; background: #232830; color: #fff; text-decoration: none; }
+.tile.lead { grid-column: span 2; grid-row: span 2; }
+.tile img { width: 100%; height: 100%; object-fit: cover; filter: saturate(0.92) brightness(0.92); }
+.tile:hover img, .tile:focus-visible img { filter: none; }
+.tile span { position: absolute; left: 0; right: 0; bottom: 0; padding: 26px 14px 11px; font-size: 15px; font-weight: 600; line-height: 1.25;
+  background: linear-gradient(to top, rgba(12, 14, 18, 0.85), rgba(12, 14, 18, 0)); }
+.tile.lead span { font-size: 19px; padding: 40px 18px 15px; }
+.tile:focus-visible { outline-offset: -3px; }
+@media (max-width: 560px) { .mosaic { grid-template-columns: 1fr; } .tile.lead { grid-column: auto; grid-row: auto; } }
+
+/* ---------------------------------------------------------------- code pair */
+.pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.pair figure { margin: 0; }
+@media (max-width: 1180px) { .pair { grid-template-columns: minmax(0, 1fr); } }
+
+/* ---------------------------------------------------------------- what's inside */
+.inside { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); column-gap: 40px; margin: 0; }
+.inside div { padding: 16px 0 18px; border-top: 1px solid var(--rule); }
+.inside dt { font-weight: 650; font-size: 17px; margin-bottom: 4px; }
+.inside dd { margin: 0; color: var(--ink-2); font-size: 15px; line-height: 1.5; max-width: 60ch; }
+
+/* ---------------------------------------------------------------- tables */
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 15px; }
+th { text-align: left; font-weight: 500; color: var(--ink-3); font-size: 13.5px; padding: 8px 14px 8px 0; border-bottom: 1px solid var(--rule); }
+td { padding: 11px 14px 11px 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
+td:first-child { font-weight: 550; }
+.bench td:nth-child(2) { color: var(--ink-2); }
+.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.bench td.num { color: var(--amber); font-weight: 650; font-size: 16px; }
+.laws td:nth-child(2) { color: var(--ink-2); max-width: 56ch; }
+.laws td:last-child { white-space: nowrap; }
+
+.page-foot { padding: 64px clamp(20px, 4vw, 56px) 48px; color: var(--ink-3); font-size: 14px; }
+.page-foot p { margin: 0; max-width: 70ch; }
+
+@media (max-width: 860px) {
+  .hero { height: 78vh; min-height: 420px; }
+  .hero-status { left: 16px; right: 16px; text-align: left; top: 12px; }
+}
