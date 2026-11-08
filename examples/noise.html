@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShaderIntel — procedural noise gallery</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="stage">
+  <canvas id="c"></canvas>
+  <div class="info"><b>Procedural noise</b> — every pattern is a few lines on top of the <code>noise</code>, <code>color</code> and
+    <code>tonemap</code> modules. Terrain lighting uses the <em>analytic</em> fBm gradient (no finite differences).</div>
+</div>
+<script src="common.js"></script>
+<script type="module">
+import * as SI from '../src/index.js';
+
+const gpu = await SI.init();
+const view = gpu.view('#c', { controls: false, hud: true, tonemap: 'none' });
+const modes = ['domain warp', 'terrain (analytic normals)', 'cells (Worley)', 'ridged', 'curl flow', 'fire', 'marble'];
+const fs = gpu.fullscreen({
+  imports: ['noise', 'color', 'math'],
+  uniforms: { mode: 'u32', scale: 'f32', speed: 'f32', octaves: 'i32' },
+  values: { mode: 0, scale: 3, speed: 0.2, octaves: 6 },
+  code: /* wgsl */`
+    fn shade(uv0: vec2f, px: vec2f) -> vec4f {
+      let aspect = cam.viewport.x / cam.viewport.y;
+      let uv = vec2f(uv0.x * aspect, uv0.y) * u.scale;
+      let t = cam.time * u.speed;
+      var c = vec3f(0.0);
+      switch u.mode {
+        case 0u: {   // Quilez-style domain warping, coloured in OKLab
+          let p = vec3f(uv, t * 0.3);
+          let q = vec3f(fbm3(p, u.octaves), fbm3(p + vec3f(5.2, 1.3, 2.8), u.octaves), 0.0);
+          let r = vec3f(fbm3(p + 4.0 * q + vec3f(1.7, 9.2, t * 0.15), u.octaves), fbm3(p + 4.0 * q + vec3f(8.3, 2.8, 0.0), u.octaves), 0.0);
+          let f = fbm3(p + 4.0 * r, u.octaves);
+          c = mixOklab(srgbToLinear(vec3f(0.07, 0.11, 0.22)), srgbToLinear(vec3f(0.95, 0.62, 0.30)), clamp(f * 1.6 + 0.5, 0.0, 1.0));
+          c = mixOklab(c, srgbToLinear(vec3f(0.35, 0.75, 0.85)), clamp(length(q.xy) * 0.9, 0.0, 1.0) * 0.6);
+          c = linearToSrgb(c);
+        }
+        case 1u: {   // terrain: height + exact gradient from fbm3d -> normal -> lambert
+          let n = fbm3d(vec3f(uv * 0.6, 1.3 + t * 0.05), u.octaves);
+          let h = n.x;
+          let nrm = normalize(vec3f(-n.y * 0.6, 1.0, -n.z * 0.6).xzy);
+          let sun = normalize(vec3f(-0.6, -0.5, 0.65));
+          let dif = clamp(dot(nrm, sun), 0.0, 1.0);
+          var base = mix(vec3f(0.12, 0.25, 0.10), vec3f(0.45, 0.38, 0.28), smoothstep(-0.05, 0.25, h));
+          base = mix(base, vec3f(0.95), smoothstep(0.3, 0.45, h));
+          if (h < -0.15) { base = vec3f(0.05, 0.18, 0.35) + 0.05 * dif; }
+          c = linearToSrgb(base * (0.25 + 1.1 * dif));
+        }
+        case 2u: {   // Worley cells: F2 - F1 gives cell borders
+          let w = worley3(vec3f(uv * 1.5, t));
+          let e = w.y - w.x;
+          c = palette(w.x * 0.8 + 0.1, vec3f(0.5), vec3f(0.5), vec3f(1.0), vec3f(0.0, 0.33, 0.67)) * smoothstep(0.0, 0.08, e);
+        }
+        case 3u: {   // ridged multifractal
+          let r = ridged3(vec3f(uv, t), u.octaves);
+          c = inferno(clamp(r * 0.9, 0.0, 1.0));
+        }
+        case 4u: {   // curl noise: colour = flow direction, brightness = speed
+          let v = curl2(uv * 0.8 + vec2f(t * 0.1, 0.0));
+          let ang = atan2(v.y, v.x) / TAU + 0.5;
+          c = linearToSrgb(oklabToLinear(vec3f(0.72, 0.13 * cos(ang * TAU), 0.13 * sin(ang * TAU)))) * clamp(length(v) * 0.4, 0.0, 1.0);
+        }
+        case 5u: {   // turbulent fire
+          let p = vec3f(uv.x, uv.y - t * 2.0, t * 0.5);
+          let f = turbulence3(p, u.octaves);
+          let h = clamp(1.1 - uv0.y * 1.2 + f * 0.9 - 0.45, 0.0, 1.0);
+          c = inferno(h * h);
+        }
+        default: {   // marble: sine of position perturbed by fBm
+          let f = fbm3(vec3f(uv, t * 0.2), u.octaves);
+          let m = 0.5 + 0.5 * sin(uv.x * 2.0 + f * 8.0);
+          c = mix(vec3f(0.15, 0.17, 0.2), vec3f(0.92, 0.9, 0.86), pow(m, 0.4));
+        }
+      }
+      // display-referred output (tonemap: 'none' on the view): add a dither, keep in [0,1]
+      return vec4f(srgbToLinear(clamp(c, vec3f(0.0), vec3f(1.0))), 1.0);
+    }`,
+});
+view.add(fs);
+SI.panel('Noise', [
+  { label: 'pattern', options: modes, onChange: (v) => fs.set({ mode: modes.indexOf(v) }) },
+  { label: 'scale', min: 0.5, max: 12, step: 0.1, value: 3, onInput: (v) => fs.set({ scale: v }) },
+  { label: 'octaves', min: 1, max: 10, step: 1, value: 6, onInput: (v) => fs.set({ octaves: v }) },
+  { label: 'speed', min: 0, max: 1, step: 0.01, value: 0.2, onInput: (v) => fs.set({ speed: v }) },
+]);
+Object.assign(window, { gpu, view, fs });
+view.run();
+</script>
+</body>
+</html>

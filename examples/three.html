@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShaderIntel × three.js — GPU physics in a three.js scene</title>
+<link rel="stylesheet" href="style.css">
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.webgpu.js",
+  "three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.webgpu.js",
+  "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.tsl.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div class="stage">
+  <canvas id="c"></canvas>
+  <div class="info"><b>three.js interop</b> — ShaderIntel simulates; three.js renders with its own lights, shadows and materials.
+    Both use one GPUDevice and the body poses go GPU→GPU into three.js storage buffers each frame (no CPU readback).
+    three.js is loaded from a CDN for this example only; the library itself has no dependencies. Click to throw a ball.</div>
+</div>
+<script src="common.js"></script>
+<script type="module">
+import * as THREE from 'three/webgpu';
+import * as TSL from 'three/tsl';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import * as SI from '../src/index.js';
+
+const gpu = await SI.init();
+const canvas = document.getElementById('c');
+const renderer = await SI.three.renderer(THREE, gpu, { canvas, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight, false);
+renderer.shadowMap.enabled = true;
+renderer.toneMapping = THREE.AgXToneMapping;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x9fb4c9);
+scene.fog = new THREE.Fog(0x9fb4c9, 30, 90);
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 200);
+camera.position.set(14, 10, 18);
+const controls = new OrbitControls(camera, canvas);
+controls.target.set(0, 2.5, 0);
+controls.enableDamping = true;
+scene.add(new THREE.HemisphereLight(0xdfeaff, 0x5a4a3a, 1.4));
+const sun = new THREE.DirectionalLight(0xffffff, 2.6);
+sun.position.set(12, 20, 8);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.bias = -0.0005;      // without a bias every lit surface shadows itself in stripes (acne)
+sun.shadow.normalBias = 0.03;
+Object.assign(sun.shadow.camera, { left: -16, right: 16, top: 16, bottom: -16, near: 1, far: 60 });
+scene.add(sun);
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), new THREE.MeshStandardNodeMaterial({ color: 0x8b8f86, roughness: 0.95 }));
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// ShaderIntel physics: a tower of crates, capsules and a pendulum wrecking ball
+const world = gpu.rigid({ maxBodies: 4096, iterations: 8 });
+for (let y = 0; y < 12; y++)
+  for (let k = 0; k < 4; k++) {
+    const a = (k / 4) * Math.PI * 2 + (y % 2) * Math.PI / 4;
+    world.addBox({ position: [Math.cos(a) * 1.6, 0.4 + y * 0.8, Math.sin(a) * 1.6], half: [0.75, 0.4, 0.3], rotation: [0, -a + Math.PI / 2, 0] });
+  }
+for (let k = 0; k < 40; k++) world.addCapsule({ position: [-6 + (k % 8) * 0.6, 0.3 + Math.floor(k / 8) * 0.65, 5], radius: 0.25, halfHeight: 0.4, rotation: [Math.PI / 2, 0, 0] });
+const pivot = [0, 12, 9];
+const chain = [];
+for (let k = 0; k < 10; k++) chain.push(world.addCapsule({ position: [0, pivot[1] - 0.4 * (k + 0.5), pivot[2]], radius: 0.06, halfHeight: 0.14 }));
+world.addJoint({ type: 'ball', a: chain[0], b: null, anchor: pivot });
+for (let k = 1; k < 10; k++) world.addJoint({ type: 'ball', a: chain[k - 1], b: chain[k], anchor: [0, pivot[1] - 0.4 * k, pivot[2]] });
+const ball = world.addSphere({ position: [0, pivot[1] - 4 - 1, pivot[2]], radius: 1, density: 3 });
+world.addJoint({ type: 'ball', a: chain[9], b: ball, anchor: [0, pivot[1] - 4, pivot[2]] });
+world.setVelocity(ball, [0, 0, -7]);
+
+const bodies = SI.three.bodies({ THREE, TSL, renderer, world });
+scene.add(bodies.object);
+
+const ray = new THREE.Raycaster();
+canvas.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0 || e.altKey) return;
+  ray.setFromCamera(new THREE.Vector2((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1), camera);
+  const o = ray.ray.origin, d = ray.ray.direction;
+  world.addSphere({ position: [o.x + d.x * 2, o.y + d.y * 2, o.z + d.z * 2], radius: 0.4, density: 4, velocity: [d.x * 30, d.y * 30, d.z * 30] });
+});
+addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight, false); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); });
+
+function frame() {
+  controls.update();
+  world.step(1 / 60);
+  bodies.update();
+  gpu.flush();                 // ShaderIntel's work is submitted before three.js renders
+  renderer.render(scene, camera);
+}
+renderer.setAnimationLoop(frame);
+Object.assign(window, { gpu, world, renderer, scene, camera, bodies, frame, THREE });
+</script>
+</body>
+</html>

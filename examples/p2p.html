@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShaderIntel — peer-to-peer GPU physics with rollback netcode</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  .duo { position: fixed; inset: 0; display: flex; gap: 2px; background: #000; }
+  .duo .side { position: relative; flex: 1; }
+  .duo canvas { width: 100%; height: 100%; display: block; }
+  .tag { position: absolute; top: 10px; left: 12px; font: 600 13px system-ui, sans-serif; color: #e9edf2; background: #0009; padding: 6px 10px; border-radius: 8px; }
+  .net { position: absolute; bottom: 12px; left: 12px; right: 12px; font: 12px ui-monospace, Menlo, monospace; color: #c9d1d9; background: #0b0f17cc; padding: 8px 10px; border-radius: 8px; white-space: pre; }
+</style>
+</head>
+<body>
+<div class="duo">
+  <div class="side"><canvas id="c1"></canvas><div class="tag">Peer A — player 1 (<kbd>A</kbd>/<kbd>D</kbd> move, <kbd>W</kbd> fire)</div><div class="net" id="n1"></div></div>
+  <div class="side"><canvas id="c2"></canvas><div class="tag">Peer B — player 2 (<kbd>←</kbd>/<kbd>→</kbd> move, <kbd>↑</kbd> fire)</div><div class="net" id="n2"></div></div>
+</div>
+<script src="common.js"></script>
+<script type="module">
+import * as SI from '../src/index.js';
+import { createDuel, bot } from '../tests/duel.js';
+
+// Two complete peers in one page: each has its own GPU physics world and rollback session,
+// and they talk only through a simulated network (latency, jitter, loss). Their worlds stay
+// bit-identical — compare the state hashes they exchange every half second.
+// With ?webrtc=room this tab runs a single peer and finds the other tab (?webrtc=room&host)
+// through BroadcastChannel signalling; inputs then travel over a WebRTC data channel.
+const params = new URLSearchParams(location.search);
+const gpu = await SI.init();
+const webrtc = params.has('webrtc');
+const net = new SI.net.LoopbackNetwork({ latency: 50, jitter: 15, loss: 0.05, seed: 3 });
+const peers = [];
+if (webrtc) {
+  const host = params.has('host');
+  document.querySelectorAll('.side')[host ? 1 : 0].remove();
+  const status = document.getElementById(host ? 'n1' : 'n2');
+  status.textContent = 'waiting for the other tab…';
+  const rtc = window.rtc = new SI.net.RTCPeer(new SI.net.BroadcastSignaler(params.get('webrtc') || 'duel'), { initiator: host });
+  await rtc.ready;
+  peers.push({ duel: createDuel(gpu), channel: rtc.channels, player: host ? 0 : 1, canvas: host ? '#c1' : '#c2', info: host ? 'n1' : 'n2',
+    cam: { target: [0, 2, 0], distance: 26, yaw: host ? -1.25 : 1.25, pitch: 0.32 } });
+} else {
+  const [chA, chB] = net.connect();
+  peers.push({ duel: createDuel(gpu), channel: chA, player: 0, canvas: '#c1', info: 'n1', cam: { target: [0, 2, 0], distance: 26, yaw: -1.25, pitch: 0.32 } });
+  peers.push({ duel: createDuel(gpu), channel: chB, player: 1, canvas: '#c2', info: 'n2', cam: { target: [0, 2, 0], distance: 26, yaw: 1.25, pitch: 0.32 } });
+}
+for (const p of peers) {
+  p.session = new SI.net.RollbackSession({ sim: p.duel.world, game: p.duel.game, channel: p.channel, players: 2, localPlayer: p.player,
+    applyInputs: p.duel.applyInputs, delay: 2, maxRollback: 12, hashEvery: 30 });
+  p.view = gpu.view(p.canvas, { camera: p.cam, hud: false });
+  p.view.add(gpu.stage({ height: 0, cell: 1 }));
+  p.view.add(gpu.bodies(p.duel.world));
+}
+
+const keys = new Set();
+addEventListener('keydown', (e) => keys.add(e.key.toLowerCase()));
+addEventListener('keyup', (e) => keys.delete(e.key.toLowerCase()));
+const settings = { bot1: !webrtc, bot2: !webrtc };
+const bots = [bot(11), bot(29)];
+const human = [
+  () => (keys.has('a') ? 1 : 0) | (keys.has('d') ? 2 : 0) | (keys.has('w') ? 4 : 0),
+  () => (keys.has('arrowleft') ? 1 : 0) | (keys.has('arrowright') ? 2 : 0) | (keys.has('arrowup') ? 4 : 0),
+];
+SI.panel('Network', [
+  ...(webrtc ? [] : [
+    { label: 'latency (ms)', min: 0, max: 200, step: 5, value: net.latency, onInput: (v) => (net.latency = v) },
+    { label: 'jitter (ms)', min: 0, max: 80, step: 1, value: net.jitter, onInput: (v) => (net.jitter = v) },
+    { label: 'packet loss', min: 0, max: 0.4, step: 0.01, value: net.loss, onInput: (v) => (net.loss = v) },
+  ]),
+  { label: 'player 1 is a bot', value: settings.bot1, onChange: (v) => (settings.bot1 = v) },
+  { label: 'player 2 is a bot', value: settings.bot2, onChange: (v) => (settings.bot2 = v) },
+  { html: webrtc ? 'WebRTC mode: one peer per tab.' : 'Real P2P: open this page in two tabs with <code>?webrtc=room</code> (one adds <code>&host</code>); signalling goes over BroadcastChannel, data over WebRTC.' },
+]);
+
+const fmt = (p) => {
+  const s = p.session, st = s.stats;
+  const last = [...s.hashes.entries()].filter(([, h]) => h.local && h.remote).slice(-1)[0];
+  return `tick ${s.tick}  confirmed ${s.confirmedTick}  ping ${st.ping} ms\n` +
+    `rollbacks ${st.rollbacks} (${st.rolledBackTicks} ticks re-simulated)  stalls ${st.stalls}  resyncs ${st.resyncs + st.statesSent}\n` +
+    `state hash @${last ? last[0] : '-'}: ${last ? last[1].local : '-'} ${last ? (last[1].local === last[1].remote ? '= peer ✓' : '≠ peer ✗') : ''}\n` +
+    `bodies ${p.duel.world.count}  shots ${p.duel.game.shots.join(' : ')}  transcript ${s.chain.slice(0, 12)}…`;
+};
+let acc = 0, last = performance.now();
+peers[0].view.run(({ dt }) => {
+  acc += performance.now() - last; last = performance.now();
+  // fixed 60 Hz ticks for every peer in this page, whatever the display rate
+  for (let n = 0; acc >= 1000 / 60 && n < 4; n++, acc -= 1000 / 60) {
+    for (const p of peers) {
+      const t = p.session.tick;
+      const b = (p.player === 0 ? settings.bot1 : settings.bot2) ? bots[p.player](t)[0] : human[p.player]();
+      p.session.advance(new Uint8Array([b]));
+    }
+  }
+  for (const p of peers.slice(1)) { p.view.camera.update(dt); p.view.render(); }
+  for (const p of peers) document.getElementById(p.info).textContent = fmt(p);
+});
+Object.assign(window, { gpu, net, peers });
+</script>
+</body>
+</html>

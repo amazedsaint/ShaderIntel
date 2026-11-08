@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShaderIntel — boids at scale</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="stage">
+  <canvas id="c"></canvas>
+  <div class="info"><b>Flocking</b> — Reynolds boids with neighbours from a counting-sort grid, re-sorted every frame for coherent memory access.
+    <kbd>alt</kbd>/<kbd>⌘</kbd>-drag to chase them with a predator.</div>
+</div>
+<script src="common.js"></script>
+<script type="module">
+import * as SI from '../src/index.js';
+
+const params = new URLSearchParams(location.search);
+const gpu = await SI.init();
+const view = gpu.view('#c', { camera: { distance: 3.4, pitch: 0.35, yaw: 0.5 }, hud: true, background: [0.03, 0.04, 0.06, 1] });
+view.add(SI.Lines.box(gpu, [-1, -1, -1], [1, 1, 1], [0.2, 0.25, 0.32, 1]));
+
+const count = +(params.get('n') || 131072);
+const flock = gpu.boids({ count, radius: 0.05 }).randomize();
+const glyphs = gpu.glyphs({ pos: flock.pos, vel: flock.vel, count, size: 0.0085, colorBy: 'heading' });
+view.add(glyphs);
+
+const P = flock.params;
+SI.panel('Boids', [
+  { label: 'separation', min: 0, max: 4, step: 0.05, value: P.separation, onInput: (v) => (P.separation = v) },
+  { label: 'alignment', min: 0, max: 4, step: 0.05, value: P.alignment, onInput: (v) => (P.alignment = v) },
+  { label: 'cohesion', min: 0, max: 4, step: 0.05, value: P.cohesion, onInput: (v) => (P.cohesion = v) },
+  { label: 'max speed', min: 0.1, max: 1.5, step: 0.05, value: P.maxSpeed, onInput: (v) => (P.maxSpeed = v) },
+  { label: 'colour', options: ['heading', 'speed', 'constant'], onChange: (v) => glyphs.set({ colorBy: { constant: 0, speed: 1, heading: 2 }[v] }) },
+  { label: 'scatter', onClick: () => flock.randomize((Math.random() * 1e9) | 0) },
+  { html: `${count.toLocaleString()} boids · try <a href="?n=524288">512k</a> or <a href="?n=1048576">1M</a>` },
+]);
+Object.assign(window, { gpu, view, flock });
+view.run(({ dt }) => {
+  const p = view.pointer;
+  if (p.down && (p.alt || p.ctrl)) {
+    const r = view.ray();
+    const t = SI.v3.len(SI.v3.sub(view.camera.eye(), view.camera.target));
+    P.predator = SI.v3.add(r.origin, SI.v3.scale(r.dir, t));
+    P.predatorRadius = 0.35;
+  } else P.predatorRadius = 0;
+  flock.step(dt);
+});
+</script>
+</body>
+</html>

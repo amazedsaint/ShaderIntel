@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShaderIntel — neural field: an MLP learns an image on the GPU</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="stage">
+  <canvas id="c"></canvas>
+  <div class="info"><b>Neural field</b> — an MLP with Fourier features learns f(x, y) = RGB of the left image. Training (forward,
+    backpropagation, Adam) and drawing the right image (every pixel through the network, every frame) run on the GPU with
+    ShaderIntel's tiled GEMM. The loss is checked against a CPU reference in the test suite.</div>
+</div>
+<script src="common.js"></script>
+<script type="module">
+import * as SI from '../src/index.js';
+
+const params = new URLSearchParams(location.search);
+const gpu = await SI.init();
+const view = gpu.view('#c', { controls: false, hud: true, tonemap: 'none' });
+const R = +(params.get('res') || 256), N = R * R;
+
+// the target: drawn with the 2D canvas API, read back as linear RGB
+const cv = new OffscreenCanvas(R, R), g = cv.getContext('2d');
+const grad = g.createLinearGradient(0, 0, R, R);
+grad.addColorStop(0, '#13223f'); grad.addColorStop(0.5, '#3d6fb6'); grad.addColorStop(1, '#f2b25c');
+g.fillStyle = grad; g.fillRect(0, 0, R, R);
+for (let k = 0; k < 7; k++) {
+  g.beginPath(); g.arc(R * (0.15 + 0.12 * k), R * (0.25 + 0.08 * Math.sin(k * 1.3)), R * (0.03 + 0.012 * k), 0, Math.PI * 2);
+  g.fillStyle = `hsl(${k * 47} 80% 60%)`; g.fill();
+}
+g.fillStyle = '#ffffff'; g.font = `bold ${R * 0.16}px system-ui, sans-serif`; g.textAlign = 'center';
+g.fillText('Shader', R / 2, R * 0.62); g.fillText('Intel', R / 2, R * 0.8);
+g.strokeStyle = '#0b0f17'; g.lineWidth = R / 64;
+for (let k = 0; k < 6; k++) { g.beginPath(); g.moveTo(0, R * 0.88 + k * 3); g.lineTo(R, R * 0.86 + k * 5); g.stroke(); }
+const px = g.getImageData(0, 0, R, R).data;
+const target = new Float32Array(N * 3), coords = new Float32Array(N * 2);
+const lin = (c) => { c /= 255; return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; };
+for (let y = 0; y < R; y++) for (let x = 0; x < R; x++) {
+  const k = y * R + x, o = ((R - 1 - y) * R + x) * 4;
+  target[3 * k] = lin(px[o]); target[3 * k + 1] = lin(px[o + 1]); target[3 * k + 2] = lin(px[o + 2]);
+  coords[2 * k] = (x + 0.5) / R * 2 - 1; coords[2 * k + 1] = (y + 0.5) / R * 2 - 1;
+}
+const T = gpu.array('f32', target), X = gpu.array('f32', coords);
+
+const batch = 16384;
+const make = (o) => new SI.nn.MLP(gpu, { layers: [2, o.width, o.width, o.width, 3], act: 'relu', out: 'sigmoid', fourier: o.bands, maxBatch: Math.max(N, batch), seed: 7 });
+let net = make({ width: 128, bands: 8 });
+let opt = new SI.nn.Adam(gpu, net.params, { lr: 2e-3 });
+const loss = new SI.nn.MSELoss(gpu, batch * 3);
+const bx = gpu.array('f32', batch * 2), bt = gpu.array('f32', batch * 3);
+// a fresh random batch of pixels every step
+const sample = gpu.kernel({
+  name: 'nf-sample', imports: ['hash'],
+  buffers: { X: { type: 'f32', access: 'read' }, T: { type: 'f32', access: 'read' }, bx: { type: 'f32' }, bt: { type: 'f32' } },
+  uniforms: { seed: 'u32', count: 'u32' },
+  code: /* wgsl */`
+    let k = pcg(i * 747796405u + u.seed) % u.count;
+    bx[2u * i] = X[2u * k]; bx[2u * i + 1u] = X[2u * k + 1u];
+    bt[3u * i] = T[3u * k]; bt[3u * i + 1u] = T[3u * k + 1u]; bt[3u * i + 2u] = T[3u * k + 2u];`,
+});
+const out = gpu.array('f32', N * 3);
+const fs = gpu.fullscreen({
+  buffers: { T: { type: 'f32', access: 'read' }, Y: { type: 'f32', access: 'read' } },
+  uniforms: { res: 'u32' },
+  code: /* wgsl */`
+    fn shade(uv: vec2f, px: vec2f) -> vec4f {
+      let aspect = cam.viewport.x / cam.viewport.y;
+      // two square panels side by side
+      let s = min(1.0 / 2.2 * aspect, 0.9);
+      var p = vec2f((uv.x - 0.5) * aspect, uv.y - 0.5) / s;
+      let left = p.x < 0.0;
+      p.x = select(p.x - 0.55, p.x + 0.55, left);
+      if (abs(p.x) > 0.5 || abs(p.y) > 0.5) { return vec4f(vec3f(0.035), 1.0); }
+      let q = vec2u(clamp((p + 0.5) * f32(u.res), vec2f(0.0), vec2f(f32(u.res) - 1.0)));
+      let k = q.y * u.res + q.x;
+      if (left) { return vec4f(T[3u * k], T[3u * k + 1u], T[3u * k + 2u], 1.0); }
+      return vec4f(Y[3u * k], Y[3u * k + 1u], Y[3u * k + 2u], 1.0);
+    }`,
+});
+fs.set({ res: R });
+view.add(fs);
+
+let step = 0, last = 0, lossValue = NaN, stepsPerFrame = 4;
+SI.panel('Neural field', [
+  { label: 'width', options: ['64', '128', '256'], value: '128', onChange: (v) => { net = make({ width: +v, bands: 8 }); opt = new SI.nn.Adam(gpu, net.params, { lr: 2e-3 }); step = 0; } },
+  { label: 'steps / frame', min: 1, max: 16, step: 1, value: stepsPerFrame, onInput: (v) => (stepsPerFrame = v) },
+  { label: 'learning rate', min: 1e-4, max: 1e-2, step: 1e-4, value: 2e-3, onInput: (v) => (opt.lr = v) },
+  { label: 'reset', onClick: () => { net = make({ width: net.layers[0].out, bands: 8 }); opt = new SI.nn.Adam(gpu, net.params, { lr: 2e-3 }); step = 0; } },
+]);
+// the loss is read back every 32 steps (asynchronously); until the first read there is nothing to show
+view.hud.extra = () => [`step ${step} · loss ${Number.isNaN(lossValue) ? '…' : lossValue.toExponential(2)} · PSNR ${Number.isNaN(lossValue) ? '…' : (10 * Math.log10(1 / lossValue)).toFixed(1)} dB · ${net.parameterCount.toLocaleString()} parameters`];
+Object.assign(window, { gpu, view, net: () => net });
+view.run(() => {
+  for (let s = 0; s < stepsPerFrame; s++) {
+    sample.run(batch, { seed: (step * 2654435761) >>> 0, count: N }, { X, T, bx, bt });
+    net.forward(bx, batch);
+    net.backward(loss.run(net.output, bt, batch * 3), batch);
+    opt.step();
+    step++;
+  }
+  if (step - last >= 32) { last = step; loss.readLoss().then((v) => (lossValue = v)); }
+  net.forward(X, N);
+  gpu.copy(net.output, out, N * 12);
+  fs.bind({ T, Y: out });
+});
+</script>
+</body>
+</html>

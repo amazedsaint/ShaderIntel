@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShaderIntel — MLS-MPM: water, jelly, snow, sand</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="stage">
+  <canvas id="c"></canvas>
+  <div class="info"><b>MLS-MPM</b> — water, jelly, snow and sand in one solver. Drag to orbit, wheel to zoom,
+    <kbd>alt</kbd>/<kbd>⌘</kbd>-drag to push with the ball.</div>
+</div>
+<script src="common.js"></script>
+<script type="module">
+import * as SI from '../src/index.js';
+
+const gpu = await SI.init();
+const view = gpu.view('#c', { camera: { target: [0.5, 0.25, 0.5], distance: 1.75, pitch: 0.42, yaw: 0.7 }, hud: true });
+view.add(gpu.stage({ height: 0 }));
+view.add(SI.Lines.box(gpu, [0, 0, 0], [1, 1, 1]));
+
+const params = new URLSearchParams(location.search);
+const sim = gpu.mpm({ grid: +(params.get('grid') || 64), maxParticles: 1 << 20, substeps: +(params.get('substeps') || 8), timeScale: 0.8 });
+
+function scene(name) {
+  sim.clear();
+  if (name === 'dam break + jelly') {
+    sim.add({ box: [[0.04, 0.04, 0.04], [0.42, 0.6, 0.96]] }, { material: 'water' });
+    sim.add({ sphere: [[0.72, 0.55, 0.5], 0.12] }, { material: 'jelly', velocity: [0, -1, 0] });
+    sim.add({ box: [[0.62, 0.05, 0.15], [0.82, 0.25, 0.35]] }, { material: 'rubber' });
+  } else if (name === 'snow + sand') {
+    sim.add({ box: [[0.05, 0.05, 0.05], [0.35, 0.3, 0.95]] }, { material: 'sand' });
+    sim.add({ sphere: [[0.65, 0.55, 0.35], 0.13] }, { material: 'snow', velocity: [-1.5, -0.5, 0] });
+    sim.add({ sphere: [[0.65, 0.55, 0.7], 0.13] }, { material: 'snow', velocity: [-1.5, -0.5, 0] });
+  } else {
+    sim.add({ box: [[0.05, 0.05, 0.05], [0.95, 0.12, 0.95]] }, { material: 'water' });
+    for (let k = 0; k < 5; k++) sim.add({ sphere: [[0.2 + 0.15 * k, 0.4 + 0.08 * k, 0.5], 0.06] }, { material: ['jelly', 'snow', 'sand', 'rubber', 'honey'][k] });
+  }
+}
+let current = params.get('scene') || 'dam break + jelly';
+scene(current);
+
+let layer = view.add(sim.spheres({ solidsOnly: true }));
+const water = view.add(sim.fluid());
+const ball = { type: 'sphere', center: [0.5, 1.4, 0.5], radius: 0.08, velocity: [0, 0, 0], friction: 0.2 };
+const ballLayer = gpu.spheres({ data: gpu.array('vec4f', [0, 0, 0, 0]), radius: 0.08, count: 1, palette: [[0.9, 0.9, 0.9]] });
+view.add({ draw(pass, v) { if (ballOn) ballLayer.set({ offset: ball.center, radius: ball.radius }).draw(pass, v); } });
+let ballOn = false;
+
+SI.panel('MLS-MPM', [
+  { label: 'scene', options: ['dam break + jelly', 'snow + sand', 'pool + bodies'], value: current, onChange: (v) => { current = v; scene(v); } },
+  { label: 'substeps', min: 2, max: 24, step: 1, value: sim.substeps, onInput: (v) => { sim.substeps = v; sim._uploadMaterials(); } },
+  { label: 'water', options: ['surface', 'particles'], onChange: (v) => {
+      view.remove(layer); view.remove(water);
+      layer = view.add(sim.spheres({ solidsOnly: v === 'surface' }));
+      if (v === 'surface') view.add(water);
+    } },
+  { label: 'reset', onClick: () => scene(current) },
+  { html: `${sim.dims.join('×')} grid, dx = ${(sim.dx * 1000).toFixed(1)} mm` },
+]);
+
+view.hud.extra = () => [`particles ${sim.count.toLocaleString()}`];
+Object.assign(window, { gpu, view, sim }); // handy from the devtools console
+view.run(({ dt }) => {
+  const p = view.pointer;
+  ballOn = p.down && (p.alt || p.ctrl);
+  if (ballOn) {
+    const r = view.ray();
+    const t = (0.35 - r.origin[1]) / r.dir[1];
+    const target = t > 0 ? SI.v3.add(r.origin, SI.v3.scale(r.dir, t)) : ball.center;
+    target[0] = Math.min(0.92, Math.max(0.08, target[0]));
+    target[2] = Math.min(0.92, Math.max(0.08, target[2]));
+    ball.velocity = SI.v3.scale(SI.v3.sub(target, ball.center), 1 / Math.max(dt, 1e-3));
+    ball.center = target;
+  } else { ball.velocity = [0, 0, 0]; ball.center = [0.5, 1.4, 0.5]; }
+  sim.setColliders(ballOn ? [ball] : []);
+  sim.step();
+});
+</script>
+</body>
+</html>

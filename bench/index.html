@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShaderIntel — benchmarks</title>
+<style>
+  .viz-root {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface-1: #1a1a19;
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --series-1: #3987e5;
+    --good: #0ca30c;
+    --critical: #d03b3b;
+    --border: rgba(255, 255, 255, 0.10);
+  }
+  html, body { margin: 0; background: #0d0d0d; }
+  .viz-root { font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--text-primary); background: var(--page);
+    min-height: 100vh; padding: 28px clamp(16px, 4vw, 48px) 48px; box-sizing: border-box; }
+  h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--text-secondary); margin: 0 0 20px; max-width: 900px; }
+  .row { display: flex; gap: 12px; align-items: center; margin-bottom: 18px; flex-wrap: wrap; }
+  button { background: #22303f; color: var(--text-primary); border: 1px solid #344558; border-radius: 6px; padding: 7px 14px; font: inherit; cursor: pointer; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .status { color: var(--text-muted); }
+  .card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; margin-bottom: 20px; }
+  .card h2 { font-size: 15px; font-weight: 600; margin: 0 0 2px; }
+  .card .cap { color: var(--text-muted); font-size: 12px; margin: 0 0 12px; }
+  svg text { font: 12px system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .tick { fill: var(--text-muted); font-variant-numeric: tabular-nums; }
+  .lab { fill: var(--text-secondary); }
+  .val { fill: var(--text-primary); font-weight: 600; }
+  .bar { fill: var(--series-1); }
+  .bar:hover, .bar.focus { fill: #5598e7; }
+  .tip { position: fixed; pointer-events: none; background: #262624; border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+    font-size: 12px; color: var(--text-secondary); display: none; z-index: 5; max-width: 340px; }
+  .tip b { color: var(--text-primary); font-size: 14px; display: block; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  th { color: var(--text-muted); font-weight: 500; font-size: 12px; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td .muted { color: var(--text-muted); font-size: 12px; }
+  .ok::before { content: "✓ "; color: var(--good); font-weight: 700; }
+  .bad::before { content: "✕ "; color: var(--critical); font-weight: 700; }
+  .env { color: var(--text-muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="viz-root">
+  <h1>ShaderIntel benchmarks</h1>
+  <p class="sub">Each row runs a widely used baseline technique and the ShaderIntel kernel on <em>this</em> GPU with identical inputs,
+    checks the results agree, then times both (best of 4 batches, each ≥ 20 ms of GPU work between submit fences).</p>
+  <div class="row">
+    <button id="run">Run benchmarks</button>
+    <button id="json" disabled>Download JSON</button>
+    <span class="status" id="status"></span>
+  </div>
+  <div class="env" id="env"></div>
+  <div class="card" style="margin-top:14px">
+    <h2>Speed-up over the baseline</h2>
+    <p class="cap">ShaderIntel time vs baseline time on the same device; log scale, 1× = parity.</p>
+    <div id="chart"></div>
+  </div>
+  <div class="card">
+    <h2>Results</h2>
+    <p class="cap">Times are per run of the whole operation; throughput is ShaderIntel's.</p>
+    <table>
+      <thead><tr><th>Benchmark</th><th>Baseline</th><th>ShaderIntel</th><th style="text-align:right">Baseline</th>
+        <th style="text-align:right">ShaderIntel</th><th style="text-align:right">Speed-up</th><th style="text-align:right">Throughput</th><th>Check</th></tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+  <div class="tip" id="tip"></div>
+</div>
+<script type="module">
+import * as SI from '../src/index.js';
+import { runSuite, BENCHMARKS } from './suite.js';
+
+const $ = (id) => document.getElementById(id);
+let gpu, rows = [];
+try {
+  gpu = await SI.init();
+  const c = gpu.caps;
+  $('env').textContent = `${c.vendor} ${c.architecture} · subgroups ${c.subgroups ? `${c.subgroupMin}–${c.subgroupMax}` : 'no'} · f16 ${c.f16 ? 'yes' : 'no'} · ${navigator.userAgent.match(/(Chrome|Firefox|Safari)\/[\d.]+/)?.[0] || ''}`;
+} catch (e) { $('status').textContent = String(e.message || e); $('run').disabled = true; }
+
+function fmtMs(ms) { return ms < 1 ? `${(ms * 1000).toFixed(0)} µs` : `${ms.toFixed(2)} ms`; }
+function fmtX(x) { return x >= 100 ? `${x.toFixed(0)}×` : x >= 10 ? `${x.toFixed(1)}×` : `${x.toFixed(2)}×`; }
+
+function addRow(r) {
+  const tr = document.createElement('tr');
+  const cell = (text, cls, sub) => {
+    const td = document.createElement('td');
+    if (cls) td.className = cls;
+    td.appendChild(document.createTextNode(text));
+    if (sub) { const d = document.createElement('div'); d.className = 'muted'; d.textContent = sub; td.appendChild(d); }
+    tr.appendChild(td);
+    return td;
+  };
+  cell(r.title, '', r.note);
+  cell(r.baseline);
+  cell(r.ours);
+  if (r.error) { cell('error', 'num'); cell('', 'num'); cell('', 'num'); cell('', 'num'); cell(r.error, 'bad'); }
+  else {
+    cell(fmtMs(r.baselineMs), 'num');
+    cell(fmtMs(r.oursMs), 'num');
+    cell(fmtX(r.speedup), 'num');
+    cell(`${r.throughput.toFixed(r.throughput >= 100 ? 0 : 2)} ${r.unit}`, 'num');
+    cell(r.verified ? 'agrees' : 'MISMATCH', r.verified ? 'ok' : 'bad', r.verifyNote);
+  }
+  $('tbody').appendChild(tr);
+}
+
+function drawChart(data) {
+  const el = $('chart');
+  el.textContent = '';
+  const ok = data.filter((r) => !r.error);
+  if (!ok.length) return;
+  const W = Math.min(980, el.clientWidth || 900), right = 64, barH = 20, top = 8, axisH = 26;
+  // measure label text; wrap onto two lines when the longest label would take more than ~45% of the width
+  const mctx = document.createElement('canvas').getContext('2d');
+  mctx.font = '12px system-ui, -apple-system, "Segoe UI", sans-serif';
+  const width = (t) => mctx.measureText(t).width;
+  const maxLabel = W * 0.45;
+  const split = (t) => {
+    if (width(t) <= maxLabel) return [t];
+    const words = t.split(' ');
+    let best = [t], bestW = Infinity;
+    for (let k = 1; k < words.length; k++) {
+      const a = words.slice(0, k).join(' '), b = words.slice(k).join(' ');
+      const w = Math.max(width(a), width(b));
+      if (w < bestW) { bestW = w; best = [a, b]; }
+    }
+    return best;
+  };
+  const labels = ok.map((r) => split(r.title));
+  const twoLine = labels.some((l) => l.length > 1);
+  const rowH = twoLine ? 42 : 34;
+  const labelW = Math.ceil(Math.max(...labels.flat().map(width))) + 18;
+  const H = top + ok.length * rowH + axisH;
+  const xmin = Math.min(0.9, ...ok.map((r) => r.speedup * 0.9)), xmax = Math.max(4, ...ok.map((r) => r.speedup)) * 1.25;
+  const lx = (v) => labelW + ((Math.log10(v) - Math.log10(xmin)) / (Math.log10(xmax) - Math.log10(xmin))) * (W - labelW - right);
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('width', W); svg.setAttribute('height', H); svg.setAttribute('role', 'img');
+  svg.setAttribute('aria-label', 'Speed-up of ShaderIntel over each baseline, log scale');
+  const mk = (tag, attrs, text) => { const e = document.createElementNS(ns, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (text != null) e.textContent = text; svg.appendChild(e); return e; };
+  // keep only ticks at least 44 px apart so labels never collide
+  const ticks = [];
+  for (const t of [0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]) {
+    if (t < xmin || t > xmax) continue;
+    if (t !== 1 && ticks.length && lx(t) - lx(ticks[ticks.length - 1]) < 44) continue;
+    ticks.push(t);
+  }
+  for (const t of ticks) {
+    const x = lx(t);
+    mk('line', { x1: x, x2: x, y1: top, y2: H - axisH, stroke: t === 1 ? 'var(--axis)' : 'var(--grid)', 'stroke-width': 1 });
+    mk('text', { x, y: H - 8, 'text-anchor': 'middle', class: 'tick' }, `${t}×`);
+  }
+  const tip = $('tip');
+  ok.forEach((r, k) => {
+    const y = top + k * rowH + (rowH - barH) / 2;
+    const lines = labels[k];
+    lines.forEach((ln, q) => mk('text', { x: labelW - 12, y: y + barH / 2 + 4 + (q - (lines.length - 1) / 2) * 14, 'text-anchor': 'end', class: 'lab' }, ln));
+    const x0 = lx(1), x1 = lx(Math.max(xmin, r.speedup));
+    const left = Math.min(x0, x1), w = Math.max(2, Math.abs(x1 - x0));
+    // 4px rounded data end, square at the 1x baseline
+    const rr = Math.min(4, w / 2), up = r.speedup >= 1;
+    const d = up
+      ? `M${left},${y} h${w - rr} a${rr},${rr} 0 0 1 ${rr},${rr} v${barH - 2 * rr} a${rr},${rr} 0 0 1 ${-rr},${rr} h${-(w - rr)} z`
+      : `M${left + w},${y} h${-(w - rr)} a${rr},${rr} 0 0 0 ${-rr},${rr} v${barH - 2 * rr} a${rr},${rr} 0 0 0 ${rr},${rr} h${w - rr} z`;
+    const bar = mk('path', { d, class: 'bar', tabindex: 0 });
+    // hit target larger than the mark
+    const hit = mk('rect', { x: labelW, y: top + k * rowH, width: W - labelW, height: rowH, fill: 'transparent', tabindex: -1 });
+    mk('text', { x: up ? x1 + 6 : x1 - 6, y: y + barH / 2 + 4, 'text-anchor': up ? 'start' : 'end', class: 'val' }, fmtX(r.speedup));
+    const show = (ev) => {
+      bar.classList.add('focus');
+      tip.textContent = '';
+      const b = document.createElement('b'); b.textContent = fmtX(r.speedup); tip.appendChild(b);
+      const line = (t) => { const d2 = document.createElement('div'); d2.textContent = t; tip.appendChild(d2); };
+      line(r.title);
+      line(`baseline ${fmtMs(r.baselineMs)} → ShaderIntel ${fmtMs(r.oursMs)}`);
+      line(`${r.throughput.toFixed(r.throughput >= 100 ? 0 : 2)} ${r.unit}`);
+      tip.style.display = 'block';
+      const bx = ev?.clientX ?? bar.getBoundingClientRect().right, by = ev?.clientY ?? bar.getBoundingClientRect().top;
+      tip.style.left = `${Math.min(window.innerWidth - 360, bx + 14)}px`; tip.style.top = `${by + 14}px`;
+    };
+    const hide = () => { bar.classList.remove('focus'); tip.style.display = 'none'; };
+    for (const t of [bar, hit]) { t.addEventListener('pointermove', show); t.addEventListener('pointerleave', hide); }
+    bar.addEventListener('focus', () => show()); bar.addEventListener('blur', hide);
+  });
+  el.appendChild(svg);
+}
+
+async function run() {
+  $('run').disabled = true; $('json').disabled = true;
+  $('tbody').textContent = ''; rows = [];
+  const only = new URLSearchParams(location.search).get('only')?.split(',');
+  await runSuite(gpu, {
+    only,
+    onStatus: (s) => { $('status').textContent = s; },
+    onResult: (r) => { rows.push(r); addRow(r); drawChart(rows); },
+  });
+  drawChart(rows);
+  $('status').textContent = `done — ${rows.filter((r) => r.verified).length}/${rows.length} verified`;
+  try { localStorage.setItem('si-bench-last', JSON.stringify({ when: new Date().toISOString(), rows })); } catch {}
+  $('run').disabled = false; $('json').disabled = false;
+  window.__bench = { rows, caps: gpu.caps, done: true };
+}
+$('run').addEventListener('click', run);
+$('json').addEventListener('click', () => {
+  const blob = new Blob([JSON.stringify({ caps: gpu.caps, userAgent: navigator.userAgent, rows }, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'shaderintel-bench.json'; a.click();
+});
+window.addEventListener('resize', () => rows.length && drawChart(rows));
+if (new URLSearchParams(location.search).has('run')) run();
+else {
+  // show the previous run from this browser, if any
+  try {
+    const last = JSON.parse(localStorage.getItem('si-bench-last'));
+    if (last?.rows?.length) {
+      rows = last.rows; rows.forEach(addRow); drawChart(rows);
+      $('status').textContent = `showing the last run (${new Date(last.when).toLocaleString()}) — press Run to measure again`;
+      $('json').disabled = false;
+    }
+  } catch {}
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShaderIntel — WebGPU physics + shader library</title>
+<style>
+  :root { --bg: #08090b; --card: #111419; --line: #1f252e; --ink: #e9edf2; --sub: #9aa6b4; --mute: #6b7685; --accent: #6cb6ff; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1120px; margin: 0 auto; padding: 56px 24px 80px; }
+  h1 { font-size: 40px; line-height: 1.1; margin: 0 0 12px; letter-spacing: -0.02em; }
+  h1 span { color: var(--accent); }
+  .lede { color: var(--sub); max-width: 760px; font-size: 17px; margin: 0 0 28px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 36px; }
+  .chip { border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px; color: var(--sub); font-size: 13px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.12em; color: var(--mute); margin: 44px 0 14px; font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+  a.card { display: block; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 18px 16px; color: inherit; text-decoration: none; transition: border-color .15s, transform .15s; }
+  a.card:hover { border-color: #33445a; transform: translateY(-1px); }
+  .card h3 { margin: 0 0 6px; font-size: 16px; }
+  .card p { margin: 0; color: var(--sub); font-size: 13.5px; }
+  .card .tag { display: inline-block; margin-top: 10px; font: 12px ui-monospace, Menlo, monospace; color: var(--accent); }
+  pre { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; overflow-x: auto; font: 13px/1.55 ui-monospace, Menlo, monospace; color: #cdd6e0; }
+  .k { color: #ff9e64; } .s { color: #9ece6a; } .c { color: var(--mute); }
+  footer { margin-top: 48px; color: var(--mute); font-size: 13px; }
+  .warn { display: none; background: #2a1414; border: 1px solid #5a2a2a; color: #ffb4a9; padding: 10px 14px; border-radius: 8px; margin-bottom: 20px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="warn" id="warn">This browser has no WebGPU. Use Chrome / Edge 113+, Safari 26+ or Firefox 141+ (Windows), from <code>http://localhost</code> or https.</div>
+  <h1>Shader<span>Intel</span></h1>
+  <p class="lede">A zero-dependency WebGPU library for GPU physics, shaders, neural networks and peer-to-peer games, built
+    from first principles: rigid bodies and joints (AVBD), lattice-unit MLS-MPM coupled two-way with rigid bodies, XPBD cloth,
+    Eulerian smoke, N-body gravity, boids, GPU matrix multiply and MLPs, deterministic worlds with rollback netcode, a WGSL
+    shader library (noise with analytic gradients, SDFs, cone-marched ray marching, PBR, colour science), executable laws that
+    check all of it, and a tiny SDK that writes the WebGPU boilerplate for you.</p>
+  <div class="chips">
+    <span class="chip">0 dependencies · plain ES modules</span><span class="chip">subgroup-accelerated primitives</span>
+    <span class="chip">autotuned kernels</span><span class="chip">verified benchmarks vs. common baselines</span>
+    <span class="chip">deterministic by construction</span><span class="chip">every promise an executable law</span>
+  </div>
+
+  <pre><span class="k">import</span> * <span class="k">as</span> SI <span class="k">from</span> <span class="s">'./src/index.js'</span>;
+<span class="k">const</span> gpu  = <span class="k">await</span> SI.init();
+<span class="k">const</span> view = gpu.view(<span class="s">'#canvas'</span>, { bloom: <span class="k">true</span>, hud: <span class="k">true</span> });
+<span class="k">const</span> pos  = gpu.array(<span class="s">'vec4f'</span>, 1_000_000);                       <span class="c">// typed GPU array</span>
+<span class="k">const</span> flow = gpu.kernel({ imports: [<span class="s">'noise'</span>], buffers: { pos }, uniforms: { dt: <span class="s">'f32'</span> },
+  code: <span class="s">`pos[i] += vec4f(curl3(pos[i].xyz) * u.dt, 0.0);`</span> });           <span class="c">// just the body</span>
+view.add(gpu.points({ data: pos }));
+view.run(({ dt }) =&gt; flow.run(1_000_000, { dt }));</pre>
+
+  <h2>Physics</h2>
+  <div class="grid">
+    <a class="card" href="examples/mpm.html"><h3>MLS-MPM: water, jelly, snow, sand</h3><p>One solver, four constitutive models, lattice units, shared-memory tiled P2G, screen-space water surface.</p><span class="tag">physics/mpm.js</span></a>
+    <a class="card" href="examples/rigid.html"><h3>Rigid bodies (AVBD)</h3><p>Boxes, spheres and capsules: per-body Newton steps in graph colours, augmented-Lagrangian contacts, Coulomb friction. Pyramids that stand, walls that break, a 6,000-body pile in 4.3 ms.</p><span class="tag">physics/rigid.js</span></a>
+    <a class="card" href="examples/joints.html"><h3>Joints, ragdolls &amp; machines</h3><p>Ball, hinge, weld, rope and slider joints with limits, motors and break forces: ragdolls on stairs, a rope bridge, a car, a wrecking ball.</p><span class="tag">physics/rigid.js</span></a>
+    <a class="card" href="examples/coupling.html"><h3>Bodies in water &amp; sand</h3><p>Two-way coupling: rigid bodies are moving boundaries of the MPM grid and get back the momentum the fluid loses. Floating, sinking and splashing are not scripted.</p><span class="tag">physics/coupling.js</span></a>
+    <a class="card" href="examples/cloth.html"><h3>XPBD cloth</h3><p>Small steps, graph-coloured Gauss–Seidel, compliance-based materials, wind and colliders.</p><span class="tag">physics/cloth.js</span></a>
+    <a class="card" href="examples/smoke.html"><h3>3D smoke &amp; fire</h3><p>Eulerian grid on 3D textures, vorticity confinement, red–black SOR projection, volumetric lighting.</p><span class="tag">physics/smoke.js</span></a>
+    <a class="card" href="examples/nbody.html"><h3>Galaxy collision (N-body)</h3><p>Direct O(N²) gravity, autotuned per GPU: shared-memory tiles, register blocking, subgroups.</p><span class="tag">physics/nbody.js</span></a>
+    <a class="card" href="examples/boids.html"><h3>Boids at scale</h3><p>130k–1M flocking agents via a counting-sort neighbour grid, re-sorted every frame.</p><span class="tag">physics/boids.js</span></a>
+    <a class="card" href="examples/quickstart.html"><h3>Quickstart: 1M curl-noise particles</h3><p>The whole SDK in 30 lines: arrays, kernels, shader-library imports, a renderer.</p><span class="tag">examples/quickstart.html</span></a>
+  </div>
+
+  <h2>Games &amp; learning</h2>
+  <div class="grid">
+    <a class="card" href="examples/p2p.html"><h3>Peer-to-peer rollback netcode</h3><p>Two peers with their own GPU worlds over a lossy network: input delay, prediction, rollback through GPU snapshots, matching 64-bit state hashes.</p><span class="tag">net/</span></a>
+    <a class="card" href="examples/neural.html"><h3>Neural field on the GPU</h3><p>An MLP with Fourier features learns an image: autotuned GEMM, backprop and Adam, training and inference every frame.</p><span class="tag">nn/</span></a>
+    <a class="card" href="examples/three.html"><h3>three.js renders the physics</h3><p>ShaderIntel bodies drawn by three.js with shadows and materials on the same GPU device, poses copied GPU to GPU. Loads three.js from a CDN.</p><span class="tag">interop/three.js</span></a>
+  </div>
+
+  <h2>Shaders</h2>
+  <div class="grid">
+    <a class="card" href="examples/sdf.html"><h3>SDF scene, cone-marched</h3><p>Write only <code>map()</code>; get two-pass cone marching, soft shadows, AO and PBR.</p><span class="tag">render/sdf.js</span></a>
+    <a class="card" href="examples/noise.html"><h3>Procedural noise gallery</h3><p>Domain warping, terrain with analytic normals, Worley, ridged, curl flow, fire, marble.</p><span class="tag">shaders/noise.js</span></a>
+  </div>
+
+  <h2>Proof</h2>
+  <div class="grid">
+    <a class="card" href="bench/index.html"><h3>Benchmarks</h3><p>Each kernel vs. the technique most code uses today, on your GPU, with result verification.</p><span class="tag">bench/</span></a>
+    <a class="card" href="tests/index.html"><h3>Test suite</h3><p>Primitives against CPU references, conservation laws, friction, joints, rolling, buoyancy, backprop, two peers over a lossy network.</p><span class="tag">tests/</span></a>
+    <a class="card" href="LAWS.md"><h3>Laws</h3><p>Everything the library promises, each with a small independent checker: exact, probabilistic with a bound, or physical with a tolerance.</p><span class="tag">LAWS.md</span></a>
+    <a class="card" href="docs/GUIDE.md"><h3>Guide &amp; math</h3><p>API reference, the first-principles derivations, and every lesson learned while building it.</p><span class="tag">docs/</span></a>
+  </div>
+  <footer>Run locally with <code>node tools/serve.mjs</code> and open <code>http://localhost:8787/</code>.</footer>
+</main>
+<script>if (!navigator.gpu) document.getElementById('warn').style.display = 'block';</script>
+</body>
+</html>

@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShaderIntel — joints: ragdolls, bridges, machines (AVBD)</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="stage">
+  <canvas id="c"></canvas>
+  <div class="info"><b>Joints</b> — ball, hinge (limits, motors), fixed, distance/rope and slider joints are extra rows in the same
+    per-body Newton step as contacts. A joint's stiffness ramps up until it holds its load (scaled with a mass floor, so a chain
+    of light links holds a weight 347× heavier); joints with a break force snap. <kbd>alt</kbd>/<kbd>⌘</kbd>-click fires a ball.</div>
+</div>
+<script src="common.js"></script>
+<script type="module">
+import * as SI from '../src/index.js';
+
+const params = new URLSearchParams(location.search);
+const gpu = await SI.init();
+const view = gpu.view('#c', { camera: { far: 400, maxDistance: 200 }, hud: true });
+view.add(gpu.stage({ height: 0, cell: 1 }));
+const world = gpu.rigid({ maxBodies: 8192, iterations: 10 });
+view.add(gpu.bodies(world));
+
+// A ragdoll from capsules: ball joints at the neck, shoulders and hips, limited hinges at elbows and knees.
+function ragdoll(p, s = 1) {
+  const cap = (pos, r, hh, rot) => world.addCapsule({ position: SI.v3.add(p, pos.map((x) => x * s)), radius: r * s, halfHeight: hh * s, rotation: rot, friction: 0.8 });
+  const at = (x, y, z) => SI.v3.add(p, [x * s, y * s, z * s]);
+  const pelvis = cap([0, 1.0, 0], 0.13, 0.08, [0, 0, Math.PI / 2]);
+  const chest = cap([0, 1.38, 0], 0.15, 0.13);
+  const head = world.addSphere({ position: at(0, 1.78, 0), radius: 0.12 * s });
+  const uarmL = cap([-0.36, 1.45, 0], 0.06, 0.12, [0, 0, Math.PI / 2]);
+  const larmL = cap([-0.68, 1.45, 0], 0.05, 0.12, [0, 0, Math.PI / 2]);
+  const uarmR = cap([0.36, 1.45, 0], 0.06, 0.12, [0, 0, Math.PI / 2]);
+  const larmR = cap([0.68, 1.45, 0], 0.05, 0.12, [0, 0, Math.PI / 2]);
+  const ulegL = cap([-0.12, 0.68, 0], 0.08, 0.14);
+  const llegL = cap([-0.12, 0.25, 0], 0.07, 0.14);
+  const ulegR = cap([0.12, 0.68, 0], 0.08, 0.14);
+  const llegR = cap([0.12, 0.25, 0], 0.07, 0.14);
+  const J = (o) => world.addJoint(o);
+  J({ type: 'ball', a: pelvis, b: chest, anchor: at(0, 1.15, 0) });
+  J({ type: 'ball', a: chest, b: head, anchor: at(0, 1.62, 0) });
+  J({ type: 'ball', a: chest, b: uarmL, anchor: at(-0.2, 1.45, 0) });
+  J({ type: 'ball', a: chest, b: uarmR, anchor: at(0.2, 1.45, 0) });
+  J({ type: 'hinge', a: uarmL, b: larmL, anchor: at(-0.52, 1.45, 0), axis: [0, 1, 0], limits: [-2.4, 0] });
+  J({ type: 'hinge', a: uarmR, b: larmR, anchor: at(0.52, 1.45, 0), axis: [0, 1, 0], limits: [0, 2.4] });
+  J({ type: 'ball', a: pelvis, b: ulegL, anchor: at(-0.12, 0.9, 0) });
+  J({ type: 'ball', a: pelvis, b: ulegR, anchor: at(0.12, 0.9, 0) });
+  J({ type: 'hinge', a: ulegL, b: llegL, anchor: at(-0.12, 0.46, 0), axis: [1, 0, 0], limits: [-2.4, 0] });
+  J({ type: 'hinge', a: ulegR, b: llegR, anchor: at(0.12, 0.46, 0), axis: [1, 0, 0], limits: [-2.4, 0] });
+}
+
+const views = {
+  'ragdolls': { target: [0, 2.5, -2.5], distance: 15, yaw: 0.45, pitch: 0.3 },
+  'rope bridge': { target: [0, 3, 0], distance: 22, yaw: 0.35, pitch: 0.35 },
+  'machines': { target: [0, 2, 0], distance: 20, yaw: 0.6, pitch: 0.4 },
+  'wrecking ball': { target: [0, 4, 0], distance: 26, yaw: 0.9, pitch: 0.25 },
+};
+let tick = null;
+const scenes = {
+  'ragdolls'() {
+    // a staircase of static steps, ragdolls dropped on top
+    for (let k = 0; k < 10; k++) world.addBox({ position: [0, 0.25 + k * 0.5, -k * 0.8], half: [4, 0.25 + k * 0.5, 0.4], static: true });
+    let s = 5; const r = () => { s = (s * 16807) % 2147483647; return s / 2147483647; };
+    for (let k = 0; k < 24; k++) ragdoll([((k % 3) - 1) * 2.4 + (r() - 0.5) * 0.4, 6 + Math.floor(k / 3) * 2.2, -6 + r() * 2], 0.9 + r() * 0.2);
+  },
+  'rope bridge'() {
+    // 24 planks hung on slack ropes (one-sided distance joints) between two posts: it settles into a catenary
+    const n = 24, w = 0.42, gap = 0.12, y = 4.5, L = n * w + (n + 1) * gap;
+    world.addBox({ position: [-L / 2 - 0.5, y / 2, 0], half: [0.5, y / 2, 1.2], static: true });
+    world.addBox({ position: [L / 2 + 0.5, y / 2, 0], half: [0.5, y / 2, 1.2], static: true });
+    const planks = [], x0 = (k) => -L / 2 + gap + k * (w + gap);
+    for (let k = 0; k < n; k++) planks.push(world.addBox({ position: [x0(k) + w / 2, y, 0], half: [w / 2, 0.05, 1], density: 2 }));
+    for (let k = 0; k <= n; k++) {
+      for (const z of [-0.9, 0.9]) {
+        const left = k === 0 ? [-L / 2, y, z] : [x0(k - 1) + w, y, z];
+        const right = k === n ? [L / 2, y, z] : [x0(k), y, z];
+        const a = k === n ? planks[n - 1] : planks[k];
+        const b = k === 0 || k === n ? null : planks[k - 1];
+        world.addJoint({ type: 'distance', a, b, anchor: k === n ? left : right, anchorB: k === n ? right : left, length: gap * 1.6, rope: true });
+      }
+    }
+    let t = 0;
+    tick = () => {   // drop a crate now and then
+      if (++t % 50 === 0 && world.count < 400) world.addBox({ position: [(Math.random() - 0.5) * 8, 9, (Math.random() - 0.5) * 1.2], half: [0.25, 0.25, 0.25], density: 1 + Math.random() * 3, rotation: [Math.random(), Math.random(), 0] });
+    };
+  },
+  'machines'() {
+    // a motorised paddle wheel, a piston (slider with motor and limits) and a four-wheeled car
+    const hub = world.addBox({ position: [-5, 2, 0], half: [0.15, 0.15, 0.6], kinematic: true });
+    for (let k = 0; k < 4; k++) {
+      const a = (k * Math.PI) / 2;
+      const p = world.addBox({ position: [-5 + Math.cos(a) * 1, 2 + Math.sin(a) * 1, 0], half: [0.9, 0.06, 0.5], rotation: [0, 0, a], density: 2 });
+      world.addJoint({ type: 'fixed', a: p, b: hub, anchor: [-5, 2, 0] });
+    }
+    world.setVelocity(hub, [0, 0, 0], [0, 0, -1.5]);
+    for (let k = 0; k < 30; k++) world.addBox({ position: [-5 + (k % 6) * 0.45 - 1.2, 0.25 + Math.floor(k / 6) * 0.5, (k % 3) * 0.5 - 0.5], half: [0.2, 0.2, 0.2] });
+    const piston = world.addBox({ position: [0, 1, 0], half: [0.5, 0.5, 0.5], density: 2 });
+    const ps = world.addJoint({ type: 'slider', a: piston, b: null, anchor: [0, 1, 0], axis: [0, 1, 0], limits: [0, 2], motor: { speed: 1.5, maxForce: 400 } });
+    let dir = 1, t = 0;
+    tick = () => { if (++t % 90 === 0) { dir = -dir; world.setMotor(ps, 1.5 * dir, 400); } };
+    for (let k = 0; k < 5; k++) world.addBox({ position: [0, 1.75 + k * 0.5, 0], half: [0.25, 0.25, 0.25] });
+    const chassis = world.addBox({ position: [5, 1.0, 0], half: [1.0, 0.15, 0.55], density: 2 });
+    for (const [x, z] of [[-0.8, -0.75], [0.8, -0.75], [-0.8, 0.75], [0.8, 0.75]]) {
+      const wheel = world.addSphere({ position: [5 + x, 0.62, z], radius: 0.4, friction: 1.2 });
+      world.addJoint({ type: 'hinge', a: wheel, b: chassis, anchor: [5 + x, 0.62, z], axis: [0, 0, 1], motor: { speed: -6, maxForce: 30 } });
+    }
+    world.addBox({ position: [9, 0.0, 0], half: [1.5, 0.3, 1.5], rotation: [0, 0, 0.25], static: true });
+  },
+  'wrecking ball'() {
+    // a wall of bricks welded by breakable fixed joints, and a heavy ball on a 12-link chain
+    const W = 10, H = 10, bx = 0.4, by = 0.2;
+    const ids = [];
+    for (let j = 0; j < H; j++) for (let i = 0; i < W; i++)
+      ids.push(world.addBox({ position: [(i - W / 2 + 0.5) * 2 * bx, by + j * 2 * by, 0], half: [bx - 0.002, by - 0.002, 0.3] }));
+    for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+      const id = ids[j * W + i], x = (i - W / 2 + 0.5) * 2 * bx, y = by + j * 2 * by;
+      if (i + 1 < W) world.addJoint({ type: 'fixed', a: id, b: ids[j * W + i + 1], anchor: [x + bx, y, 0], breakForce: 120 });
+      if (j + 1 < H) world.addJoint({ type: 'fixed', a: id, b: ids[(j + 1) * W + i], anchor: [x, y + by, 0], breakForce: 120 });
+    }
+    const pivot = [0, 9, 6], seg = 0.5, n = 12;
+    const links = [];
+    for (let k = 0; k < n; k++) links.push(world.addCapsule({ position: [pivot[0], pivot[1] - seg * (k + 0.5), pivot[2] + 0.001 * k], radius: 0.06, halfHeight: seg / 2 - 0.06 }));
+    world.addJoint({ type: 'ball', a: links[0], b: null, anchor: pivot });
+    for (let k = 1; k < n; k++) world.addJoint({ type: 'ball', a: links[k - 1], b: links[k], anchor: [pivot[0], pivot[1] - seg * k, pivot[2]] });
+    const ball = world.addSphere({ position: [pivot[0], pivot[1] - seg * n - 0.8, pivot[2]], radius: 0.8, density: 6 });
+    world.addJoint({ type: 'ball', a: links[n - 1], b: ball, anchor: [pivot[0], pivot[1] - seg * n, pivot[2]] });
+    world.setVelocity(ball, [0, 0, -9]);
+  },
+};
+let current = params.get('scene') || 'ragdolls';
+function load(name) { world.clear(); tick = null; scenes[name](); current = name; Object.assign(view.camera, views[name], { target: [...views[name].target] }); }
+load(current);
+
+SI.panel('Joints', [
+  { label: 'scene', options: Object.keys(scenes), value: current, onChange: load },
+  { label: 'iterations', min: 2, max: 24, step: 1, value: world.iterations, onInput: (v) => (world.iterations = v) },
+  { label: 'substeps', min: 1, max: 4, step: 1, value: world.substeps, onInput: (v) => (world.substeps = v) },
+  { label: 'reset', onClick: () => load(current) },
+]);
+view.canvas.addEventListener('pointerdown', (e) => {
+  if (!(e.altKey || e.metaKey || e.ctrlKey)) return;
+  const r = view.ray();
+  world.addSphere({ position: SI.v3.add(r.origin, SI.v3.scale(r.dir, 1)), radius: 0.4, velocity: SI.v3.scale(r.dir, 30), density: 4 });
+});
+view.hud.extra = () => [`bodies ${world.count.toLocaleString()} · joints ${world.joints.length} · contacts ${world.stats.contacts.toLocaleString()} · colours ${world.stats.colors}`];
+Object.assign(window, { gpu, view, world, scenes, load });
+view.run(() => { tick?.(); world.step(1 / 60); });
+</script>
+</body>
+</html>

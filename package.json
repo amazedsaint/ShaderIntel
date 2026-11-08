@@ -1,0 +1,57 @@
+{
+  "name": "shaderintel",
+  "version": "0.2.0",
+  "description": "WebGPU physics (rigid bodies and joints, MLS-MPM fluids, cloth, smoke), a WGSL shader library, GPU neural networks and deterministic peer-to-peer rollback netcode, with executable correctness laws.",
+  "private": true,
+  "type": "module",
+  "main": "./dist/shaderintel.js",
+  "module": "./src/index.js",
+  "types": "./types/shaderintel.d.ts",
+  "exports": {
+    ".": {
+      "types": "./types/shaderintel.d.ts",
+      "import": "./src/index.js"
+    },
+    "./bundle": {
+      "types": "./types/shaderintel.d.ts",
+      "import": "./dist/shaderintel.js"
+    },
+    "./global": "./dist/shaderintel.global.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "dist",
+    "types",
+    "LAWS.md",
+    "README.md",
+    "docs"
+  ],
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "serve": "node tools/serve.mjs",
+    "typecheck": "tsc -p tests/types",
+    "test": "node tools/headless.mjs tests",
+    "bench": "node tools/headless.mjs bench"
+  },
+  "keywords": [
+    "webgpu",
+    "wgsl",
+    "gpu",
+    "physics",
+    "rigid-body",
+    "joints",
+    "mpm",
+    "fluid",
+    "shaders",
+    "neural-network",
+    "gemm",
+    "rollback",
+    "netcode",
+    "deterministic",
+    "verification"
+  ],
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}

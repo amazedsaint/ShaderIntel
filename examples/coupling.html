@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShaderIntel — rigid bodies in water and sand (two-way MPM coupling)</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="stage">
+  <canvas id="c"></canvas>
+  <div class="info"><b>Two-way coupling</b> — rigid bodies are moving boundaries of the MLS-MPM grid, and every grid node hands
+    the momentum it loses at a boundary back to the body. Floating, sinking, drag and splashes are not scripted: bodies lighter
+    than water float at Archimedes' waterline (to about a grid cell), and cubes of middling density roll onto an edge, as real
+    ones do — upright they are unstable. <kbd>alt</kbd>/<kbd>⌘</kbd>-click drops a crate.</div>
+</div>
+<script src="common.js"></script>
+<script type="module">
+import * as SI from '../src/index.js';
+
+const params = new URLSearchParams(location.search);
+const gpu = await SI.init();
+const view = gpu.view('#c', { camera: { target: [1.5, 0.45, 0.75], distance: 3.6, pitch: 0.42, yaw: 0.55 }, hud: true });
+view.add(gpu.stage({ height: 0, cell: 0.25 }));
+
+const size = [3, 1.2, 1.5];
+const sim = gpu.mpm({ grid: +(params.get('grid') || 96), size, maxParticles: 900000, substeps: 8 });
+const world = gpu.rigid({ maxBodies: 2048, iterations: 8, bounds: [[-1, -1, -1], [4, 4, 3]] });
+const coupling = sim.couple(world, { friction: 0.2 });
+
+// invisible static walls keep the bodies inside the tank (the fluid has its own)
+const wall = (p, h) => world.addBox({ position: p, half: h, static: true, group: 2, mask: 1 });
+const inset = sim.dx * sim.bound;
+wall([-0.25 + inset, 1, size[2] / 2], [0.25, 1, size[2]]);
+wall([size[0] + 0.25 - inset, 1, size[2] / 2], [0.25, 1, size[2]]);
+wall([size[0] / 2, 1, -0.25 + inset], [size[0], 1, 0.25]);
+wall([size[0] / 2, 1, size[2] + 0.25 - inset], [size[0], 1, 0.25]);
+
+const scenes = {
+  'floating crates'() {
+    sim.add({ box: [[0.05, 0.05, 0.05], [2.95, 0.45, 1.45]] }, { material: 'water' });
+    const dens = [0.25, 0.5, 0.75];
+    dens.forEach((d, k) => world.addBox({ position: [0.6 + k * 0.9, 0.85, 0.75], half: [0.12, 0.12, 0.12], density: d, group: 1 }));
+    world.addSphere({ position: [1.5, 1.0, 0.35], radius: 0.1, density: 3, group: 1 });
+    world.addCapsule({ position: [1.0, 0.9, 1.15], radius: 0.05, halfHeight: 0.15, rotation: [0, 0, Math.PI / 2], density: 0.6, group: 1 });
+  },
+  'dam break vs crates'() {
+    sim.add({ box: [[0.05, 0.05, 0.05], [0.9, 0.9, 1.45]] }, { material: 'water' });
+    for (let k = 0; k < 18; k++)
+      world.addBox({ position: [1.6 + (k % 3) * 0.32, 0.12 + Math.floor(k / 3) * 0.24, 0.45 + (k % 2) * 0.5], half: [0.11, 0.11, 0.11], density: 0.6, group: 1 });
+  },
+  'sand pit'() {
+    sim.add({ box: [[0.05, 0.05, 0.05], [2.95, 0.3, 1.45]] }, { material: 'sand' });
+    for (let k = 0; k < 6; k++)
+      world.addSphere({ position: [0.5 + k * 0.4, 0.8 + k * 0.15, 0.75], radius: 0.08 + k * 0.01, density: 2 + k, velocity: [0, -2, 0], group: 1 });
+    world.addBox({ position: [2.4, 0.8, 0.75], half: [0.15, 0.15, 0.15], density: 1.5, rotation: [0.3, 0.2, 0.4], group: 1 });
+  },
+};
+let current = params.get('scene') || 'floating crates';
+function load(name) {
+  sim.clear();
+  world.clear();
+  wall([-0.25 + inset, 1, size[2] / 2], [0.25, 1, size[2]]);
+  wall([size[0] + 0.25 - inset, 1, size[2] / 2], [0.25, 1, size[2]]);
+  wall([size[0] / 2, 1, -0.25 + inset], [size[0], 1, 0.25]);
+  wall([size[0] / 2, 1, size[2] + 0.25 - inset], [size[0], 1, 0.25]);
+  scenes[name]();
+  current = name;
+}
+load(current);
+
+const water = sim.fluid();
+view.add(sim.spheres({ solidsOnly: true }));
+view.add(water);
+view.add(gpu.bodies(world, { groups: 1 }));   // the tank walls (group 2) stay invisible
+
+SI.panel('Coupling', [
+  { label: 'scene', options: Object.keys(scenes), value: current, onChange: load },
+  { label: 'friction', min: 0, max: 1, step: 0.05, value: coupling.friction, onInput: (v) => (coupling.friction = v) },
+  { label: 'reset', onClick: () => load(current) },
+]);
+view.canvas.addEventListener('pointerdown', (e) => {
+  if (!(e.altKey || e.metaKey || e.ctrlKey)) return;
+  world.addBox({ position: [0.5 + Math.random() * 2, 1.0, 0.4 + Math.random() * 0.7], half: [0.1, 0.1, 0.1], density: 0.3 + Math.random() * 0.6,
+    rotation: [Math.random(), Math.random(), Math.random()], group: 1 });
+});
+view.hud.extra = () => [`particles ${sim.count.toLocaleString()} · bodies ${world.count}`];
+Object.assign(window, { gpu, view, sim, world, coupling, load, scenes });
+view.run(() => { sim.step(); world.step(1 / 60); });
+</script>
+</body>
+</html>

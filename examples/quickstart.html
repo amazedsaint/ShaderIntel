@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShaderIntel — quickstart: 1M particles in curl noise</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="stage">
+  <canvas id="c"></canvas>
+  <div class="info"><b>Quickstart</b> — one million particles advected through divergence-free curl noise.
+    The whole program is two kernels and one renderer; read the page source.</div>
+</div>
+<script src="common.js"></script>
+<script type="module">
+import * as SI from '../src/index.js';
+
+// 1. WebGPU device + a view with an orbit camera, HDR, bloom and a stats overlay.
+const gpu = await SI.init();
+const view = gpu.view('#c', { camera: { distance: 4.2, pitch: 0.3, autoRotate: 0.08 }, bloom: { strength: 0.08 }, hud: true, background: [0, 0, 0, 1] });
+
+// 2. A typed GPU array: xyz = position, w = spawn radius (used for colour).
+const N = 1_000_000;
+const pos = gpu.array('vec4f', N);
+
+// 3. Kernels are just WGSL bodies. Bindings, uniforms and the index `i` are generated;
+//    `imports` pulls functions from the shader library (hash, noise, sdf, color, ...).
+gpu.kernel({
+  imports: ['hash'], buffers: { pos },
+  code: `var s = rngSeed(i, 1u); let p = randBall(&s); pos[i] = vec4f(p, length(p));`,
+}).run(N);
+
+const flow = gpu.kernel({
+  imports: ['hash', 'noise'], buffers: { pos }, uniforms: { time: 'f32', dt: 'f32', frame: 'u32' },
+  code: /* wgsl */`
+    var p = pos[i];
+    let v = curl3(p.xyz * 0.9 + vec3f(0.0, u.time * 0.05, 0.0));   // divergence-free: no clumping
+    p = vec4f(p.xyz + v * (0.12 * u.dt), p.w);
+    if (dot(p.xyz, p.xyz) > 1.8) {                                  // respawn outside the ball
+      var s = rngSeed(i, u.frame);
+      let q = randBall(&s);
+      p = vec4f(q * 0.5, length(q));
+    }
+    pos[i] = p;`,
+});
+
+// 4. Draw as additive glow sprites, coloured by the w component through the turbo colormap.
+view.add(gpu.points({ data: pos, size: 0.002, pixelSize: 1, colorBy: 'w', intensity: 0.22 }));
+
+// 5. Run: the callback records GPU work; the view renders and submits once per frame.
+view.run(({ dt, time, frame }) => flow.run(N, { time, dt, frame }));
+Object.assign(window, { gpu, view, pos, flow });
+</script>
+</body>
+</html>

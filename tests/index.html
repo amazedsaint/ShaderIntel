@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ShaderIntel — tests</title>
+<style>
+  body { font: 13px/1.5 ui-monospace, Menlo, monospace; background: #0d1014; color: #c9d1d9; margin: 24px; }
+  h1 { font: 600 16px system-ui; margin: 0 0 12px; }
+  .pass { color: #7ee787; } .fail { color: #ff7b72; } .section { color: #79c0ff; margin-top: 10px; } .note { color: #8b949e; }
+</style>
+</head>
+<body>
+<h1>ShaderIntel test suite</h1>
+<div id="log"></div>
+<script type="module">
+import * as SI from '../src/index.js';
+import { section, finish, note } from './harness.js';
+import { coreTests, gpuTests } from './core.test.js';
+import { shaderTests } from './shaders.test.js';
+import { physicsTests } from './physics.test.js';
+import { systemsTests } from './systems.test.js';
+
+const params = new URLSearchParams(location.search);
+const only = params.get('only');
+try {
+  await coreTests();
+  const gpu = await SI.init();
+  note(`adapter: ${gpu.caps.vendor} ${gpu.caps.architecture}; subgroups=${gpu.caps.subgroups} (${gpu.caps.subgroupMin}-${gpu.caps.subgroupMax}) f16=${gpu.caps.f16} timestamps=${gpu.caps.timestamps} subgroup_id=${gpu.caps.subgroupId}`);
+  if (!only || only === 'native') await gpuTests(gpu, 'native');
+  if (!only || only === 'shaders') await shaderTests(gpu);
+  if (!only || only === 'physics') await physicsTests(gpu);
+  if (!only || only === 'systems') await systemsTests(gpu);
+  if (!only || only === 'portable') {
+    const portable = await SI.init({ subgroups: false });
+    await gpuTests(portable, 'portable');
+    await physicsTests(portable, 'portable');
+  }
+  const extra = params.get('suite');
+  if (extra) {
+    const mod = await import(`./${extra}.test.js`);
+    await mod.default(gpu);
+  }
+} catch (e) {
+  section('fatal');
+  note(String(e.stack || e));
+  window.__results.failed++;
+  window.__results.failures.push({ name: 'fatal', error: String(e) });
+}
+finish();
+</script>
+</body>
+</html>

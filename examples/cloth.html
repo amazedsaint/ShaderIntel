@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShaderIntel — XPBD cloth</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="stage">
+  <canvas id="c"></canvas>
+  <div class="info"><b>XPBD cloth</b> — small steps (many substeps × one iteration), graph-coloured Gauss–Seidel (12 race-free batches),
+    compliance-based stretch / shear / bending, noisy wind, sphere and box colliders. <kbd>alt</kbd>/<kbd>⌘</kbd>-drag moves the ball.</div>
+</div>
+<script src="common.js"></script>
+<script type="module">
+import * as SI from '../src/index.js';
+
+const params = new URLSearchParams(location.search);
+const gpu = await SI.init();
+const view = gpu.view('#c', { camera: { target: [0, 0.8, 0], distance: 3.4, pitch: 0.2, yaw: 0.45 }, hud: true });
+view.add(gpu.stage({ height: 0 }));
+
+const res = +(params.get('res') || 128);
+const ball = { type: 'sphere', center: [0, 0.75, 0.35], radius: 0.28 };
+const cloth = gpu.cloth({ width: res, height: res, size: [1.6, 1.6], origin: [-0.8, 1.7, 0], substeps: 20, pin: 'top-sparse',
+  wind: [0, 0, 2.2], colliders: [ball, { type: 'box', center: [0.45, 0.25, -0.2], half: [0.25, 0.25, 0.25] }] });
+cloth.floorY = 0;
+view.add(gpu.mesh({ pos: cloth.pos, nrm: cloth.nrm, indices: cloth.indices, indexCount: cloth.indexCount, grid: [res, res], pattern: 'checker', tiles: 16 }));
+const ballMesh = gpu.spheres({ data: gpu.array('vec4f', [0, 0, 0, 0]), count: 1, radius: ball.radius - 0.01, palette: [[0.75, 0.75, 0.78]] });
+view.add({ draw(pass, v) { ballMesh.set({ offset: ball.center }).draw(pass, v); } });
+view.add(SI.Lines.box(gpu, [0.2, 0, -0.45], [0.7, 0.5, 0.05], [0.6, 0.65, 0.7, 1]));
+
+SI.panel('Cloth', [
+  { label: 'pinning', options: ['top-sparse', 'top', 'corners', 'none'], onChange: (v) => { cloth.reset(v); if (v === 'none') { cloth.origin[1] = 1.8; cloth.reset(v); } } },
+  { label: 'substeps', min: 2, max: 40, step: 1, value: cloth.substeps, onInput: (v) => (cloth.substeps = v) },
+  { label: 'wind', min: 0, max: 8, step: 0.1, value: 2.2, onInput: (v) => (cloth.wind = [0, 0, v]) },
+  { label: 'bend (log α)', min: -8, max: -1, step: 0.1, value: -3.7, onInput: (v) => (cloth.compliance.bend = 10 ** v) },
+  { label: 'stretch (log α)', min: -9, max: -2, step: 0.1, value: -9, onInput: (v) => (cloth.compliance.stretch = v <= -9 ? 0 : 10 ** v) },
+  { label: 'reset', onClick: () => cloth.reset() },
+  { html: `${res}×${res} particles, ${(6 * res * res / 1000).toFixed(0)}k constraints, 12 dispatches per substep` },
+]);
+Object.assign(window, { gpu, view, cloth, ball });
+view.run(({ dt, time }) => {
+  const p = view.pointer;
+  if (p.down && (p.alt || p.ctrl)) {
+    const r = view.ray();
+    const t = (ball.center[2] - r.origin[2]) / r.dir[2];
+    if (t > 0) { const q = SI.v3.add(r.origin, SI.v3.scale(r.dir, t)); ball.center = [q[0], Math.max(ball.radius, q[1]), ball.center[2]]; }
+  }
+  cloth.step(dt);
+});
+</script>
+</body>
+</html>

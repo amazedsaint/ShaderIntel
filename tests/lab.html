@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ShaderIntel — lab</title>
+<style>body { font: 13px/1.5 ui-monospace, Menlo, monospace; background: #0d1014; color: #c9d1d9; margin: 24px; }</style>
+</head>
+<body>
+<p>Scratch page for interactive experiments: <code>window.SI</code> and <code>window.gpu</code> are ready when <code>window.ready</code> is true.</p>
+<canvas id="c" width="320" height="200"></canvas>
+<script type="module">
+import * as SI from '../src/index.js';
+window.SI = SI;
+window.gpu = await SI.init();
+window.ready = true;
+</script>
+</body>
+</html>

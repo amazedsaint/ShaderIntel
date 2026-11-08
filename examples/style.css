@@ -1,0 +1,9 @@
+html, body { margin: 0; height: 100%; background: #07090c; color: #d8dee9; font: 13px/1.5 system-ui, -apple-system, sans-serif; overflow: hidden; }
+.stage { position: relative; width: 100vw; height: 100vh; }
+canvas { display: block; width: 100%; height: 100%; }
+.info { position: absolute; left: 12px; bottom: 12px; max-width: 520px; padding: 8px 12px; background: rgba(10,12,16,0.72);
+  border-radius: 8px; color: #b9c4d0; font-size: 12px; pointer-events: none; }
+.info b { color: #fff; }
+.info a { pointer-events: auto; color: #6cb6ff; }
+.back { position: absolute; left: 12px; top: auto; bottom: 12px; }
+kbd { background: #1d2530; border: 1px solid #334; border-radius: 3px; padding: 0 4px; font: 11px ui-monospace, Menlo, monospace; }

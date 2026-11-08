@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ShaderIntel — bundle smoke test</title>
+<style>body { font: 13px/1.5 ui-monospace, Menlo, monospace; background: #0d1014; color: #c9d1d9; margin: 24px; } canvas { width: 320px; height: 200px; display: block; margin-top: 12px; }</style>
+</head>
+<body>
+<h3>dist/shaderintel.global.js (classic script, window.SI)</h3>
+<div id="log"></div>
+<div style="position:relative"><canvas id="c"></canvas></div>
+<script src="../dist/shaderintel.global.js"></script>
+<script type="module">
+// same results format as tests/index.html, so tools/headless.mjs can run this page too
+const results = { passed: 0, failed: 0, done: false, log: [], failures: [] };
+window.__results = results;
+const log = (t) => { results.log.push(t); document.getElementById('log').insertAdjacentHTML('beforeend', `<div>${t}</div>`); };
+async function check(name, fn) {
+  try { await fn(); results.passed++; log(`PASS ${name}`); }
+  catch (e) { results.failed++; results.failures.push({ name, error: e.message }); log(`FAIL ${name}: ${e.message}`); console.error(e); }
+}
+const SI = window.SI;
+const gpu = await SI.init();
+await check('kernel + uniforms', async () => {
+  const a = gpu.array('f32', 1000);
+  const k = gpu.kernel({ buffers: { a }, uniforms: { s: 'f32' }, code: 'a[i] = f32(i) * u.s;' });
+  await k.ready(); k.run(1000, { s: 2 });
+  const r = await a.read(); if (r[999] !== 1998) throw new Error(`got ${r[999]}`);
+});
+await check('shader library import (noise + hash)', async () => {
+  const a = gpu.array('f32', 4096);
+  const k = gpu.kernel({ imports: ['noise', 'hash'], buffers: { a }, code: 'a[i] = simplex3(vec3f(f32(i) * 0.01, 0.3, u2f(pcg(i))));' });
+  await k.ready(); k.run(4096);
+  const r = await a.read(); if (!r.every(Number.isFinite)) throw new Error('non-finite');
+});
+await check('scan 1M', async () => {
+  const n = 1 << 20, d = new Uint32Array(n).fill(1);
+  const a = gpu.array('u32', d), b = gpu.array('u32', n);
+  new SI.Scan(gpu, n).run(a, b, n);
+  const r = await b.read(n); if (r[n - 1] !== n - 1) throw new Error(`got ${r[n - 1]}`);
+});
+await check('MPM + render one frame', async () => {
+  const view = gpu.view('#c', { camera: { target: [0.5, 0.3, 0.5], distance: 2 } });
+  const sim = gpu.mpm({ grid: 32, maxParticles: 50000 });
+  sim.add({ box: [[0.1, 0.1, 0.1], [0.5, 0.5, 0.5]] }, { material: 'water' });
+  view.add(gpu.stage()); view.add(sim.spheres());
+  for (let f = 0; f < 5; f++) { sim.step(); view.render(); }
+  await gpu.idle();
+  const p = await sim.readPositions(); if (!p.every(Number.isFinite)) throw new Error('NaN');
+});
+await check('rigid bodies: a box stack settles', async () => {
+  const world = gpu.rigid({ maxBodies: 64 });
+  for (let k = 0; k < 5; k++) world.addBox({ position: [0, 0.5 + k, 0], half: [0.5, 0.5, 0.5] });
+  world.addSphere({ position: [3, 2, 0], radius: 0.4 });
+  for (let f = 0; f < 90; f++) world.step(1 / 60);
+  const p = await world.readPoses();
+  if (!p.every(Number.isFinite)) throw new Error('NaN');
+  if (Math.abs(p[4 * 7 + 1] - 4.5) > 0.02) throw new Error(`top box at y = ${p[4 * 7 + 1]}`);
+});
+await check('joints: a ball-jointed pendulum keeps its length', async () => {
+  const world = gpu.rigid({ maxBodies: 8, floor: null });
+  const bob = world.addSphere({ position: [1, 3, 0], radius: 0.1 });
+  world.addJoint({ type: 'ball', a: bob, b: null, anchor: [0, 3, 0] });
+  for (let f = 0; f < 60; f++) world.step(1 / 60);
+  const p = await world.readPoses();
+  const len = Math.hypot(p[0], p[1] - 3, p[2]);
+  if (Math.abs(len - 1) > 1e-3) throw new Error(`length ${len}`);
+});
+await check('gemm + Freivalds certificate', async () => {
+  const M = 129, N = 70, K = 333, R = (n) => new Float32Array(n).map((_, k) => Math.sin(k * 1.7));
+  const A = gpu.array('f32', R(M * K)), B = gpu.array('f32', R(K * N)), C = gpu.array('f32', M * N);
+  SI.nn.gemm(gpu, A, B, C, { M, N, K, act: 'relu' });
+  SI.nn.gemm(gpu, A, B, C, { M, N, K });
+  const v = await SI.verify.freivalds(gpu, A, B, C, { M, N, K, trials: 6 });
+  if (!v.ok) throw new Error(`rejected (${v.maxRelative})`);
+});
+await check('MLP forward + backward', async () => {
+  const net = new SI.nn.MLP(gpu, { layers: [2, 16, 1], act: 'tanh', maxBatch: 64 });
+  net.input.write(new Float32Array(128).map((_, k) => k / 128));
+  net.forward(net.input, 64);
+  const loss = new SI.nn.MSELoss(gpu, 64);
+  net.backward(loss.run(net.output, gpu.array('f32', 64), 64), 64);
+  new SI.nn.Adam(gpu, net.params, { lr: 1e-3 }).step();
+  const g = await net.params[0].g.read();
+  if (!g.every(Number.isFinite) || !g.some((x) => x !== 0)) throw new Error('gradients missing');
+});
+await check('binding contract rejects a mis-sized buffer', async () => {
+  const k = gpu.kernel({ shared: 'struct Rec { a: vec4f, b: vec4f, c: vec4f }', buffers: { v: { type: 'Rec' } }, code: 'v[i].a = vec4f(1.0);' });
+  const bad = gpu.array('f32', 20);   // 80 bytes is not a whole number of 48-byte records
+  let err = null;
+  try { k.run(1, null, { v: bad }); } catch (e) { err = e; }
+  if (!err || !/whole number/.test(err.message)) throw new Error('accepted an 80-byte buffer for 48-byte records');
+});
+await check('rollback sessions over a loopback network agree', async () => {
+  const mk = () => { const w = gpu.rigid({ maxBodies: 16, deterministic: true }); for (let k = 0; k < 4; k++) w.addBox({ position: [k * 0.3, 0.5 + k, 0] }); return w; };
+  const net = new SI.net.LoopbackNetwork({ latency: 20, jitter: 5, loss: 0.1, seed: 2 });
+  const [ca, cb] = net.connect();
+  const apply = (w) => (t, inputs) => inputs.forEach((b, p) => { if (b[0] & 1) w.applyImpulse(p, [0, 0.5, 0]); });
+  const wa = mk(), wb = mk();
+  const sa = new SI.net.RollbackSession({ sim: wa, channel: ca, localPlayer: 0, applyInputs: apply(wa), hashEvery: 20 });
+  const sb = new SI.net.RollbackSession({ sim: wb, channel: cb, localPlayer: 1, applyInputs: apply(wb), hashEvery: 20 });
+  while (sa.tick < 90 || sb.tick < 90) { sa.advance(new Uint8Array([sa.tick % 7 === 0 ? 1 : 0])); sb.advance(new Uint8Array([sb.tick % 5 === 0 ? 1 : 0])); await new Promise((r) => setTimeout(r, 4)); }
+  for (let k = 0; k < 12; k++) { sa.advance(); sb.advance(); await new Promise((r) => setTimeout(r, 30)); }
+  await new Promise((r) => setTimeout(r, 200));
+  const both = [...sa.hashes.values()].filter((h) => h.local && h.remote);
+  if (both.length < 2 || both.some((h) => h.local !== h.remote)) throw new Error(`${both.length} checkpoints, ${sa.stats.desyncs} desyncs`);
+});
+await check('save game: exportState → wire encoding → importState in a fresh world, same hash', async () => {
+  const mk = () => { const w = gpu.rigid({ maxBodies: 64, deterministic: true }); for (let k = 0; k < 8; k++) w.addBox({ position: [k * 0.25, 0.5 + k * 0.9, 0], rotation: [0.1 * k, 0, 0], group: 1 << (k % 3) }); return w; };
+  const a = mk();
+  for (let f = 0; f < 45; f++) a.step(1 / 60);
+  const st = SI.net.decode(SI.net.encode(await a.exportState()));
+  const b = gpu.rigid({ maxBodies: 64, deterministic: true });
+  b.importState(st);
+  const [ha, hb] = [await a.hash(), await b.hash()];
+  if (ha !== hb) throw new Error(`hash ${ha} vs ${hb} after import`);
+  for (let f = 0; f < 45; f++) { a.step(1 / 60); b.step(1 / 60); }
+  const [ha2, hb2] = [await a.hash(), await b.hash()];
+  if (ha2 !== hb2) throw new Error(`diverged after import: ${ha2} vs ${hb2}`);
+});
+await check('laws: scan and gemm prove', async () => {
+  const res = await SI.verify.proveAll(gpu, SI, ['scan', 'gemm']);
+  if (res.length !== 2 || !res.every((r) => r.ok)) throw new Error(JSON.stringify(res.map((r) => [r.name, r.ok])));
+});
+results.done = true;
+log(`${results.passed} passed, ${results.failed} failed`);
+</script>
+</body>
+</html>

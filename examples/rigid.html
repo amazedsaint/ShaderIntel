@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShaderIntel — rigid bodies (Augmented Vertex Block Descent)</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="stage">
+  <canvas id="c"></canvas>
+  <div class="info"><b>Rigid bodies</b> — Augmented Vertex Block Descent on the GPU: per-body 6×6 Newton steps in parallel graph colours,
+    augmented-Lagrangian contacts with Coulomb friction, warm-started from a GPU hash table. <kbd>alt</kbd>/<kbd>⌘</kbd>-click fires a ball.</div>
+</div>
+<script src="common.js"></script>
+<script type="module">
+import * as SI from '../src/index.js';
+
+const params = new URLSearchParams(location.search);
+const gpu = await SI.init();
+const view = gpu.view('#c', { camera: { far: 400, maxDistance: 200 }, hud: true });
+view.add(gpu.stage({ height: 0, cell: 1 }));
+
+const world = gpu.rigid({ maxBodies: 65535, iterations: +(params.get('it') || 8) });
+view.add(gpu.bodies(world));
+
+// each scene: build it, and where to look at it from
+const views = {
+  'pyramid': { target: [0, 8, 0], distance: 38, yaw: 0.35, pitch: 0.22 },
+  'wall + cannonball': { target: [0, 3, 0], distance: 26, yaw: 0.75, pitch: 0.25 },
+  'pile': { target: [0, 1, 0], distance: 22, yaw: 0.6, pitch: 0.55 },
+};
+const scenes = {
+  'pyramid'() {
+    const n = 20, s = 0.5;
+    for (let row = 0; row < n; row++)
+      for (let k = 0; k < n - row; k++)
+        world.addBox({ position: [(k - (n - row - 1) / 2) * 2.02 * s, s + row * 2 * s, 0], half: [s, s, s] });
+  },
+  'wall + cannonball'() {
+    const w = 24, h = 14, hx = 0.5, hy = 0.25, hz = 0.25;
+    for (let row = 0; row < h; row++)
+      for (let k = 0; k < w; k++)
+        world.addBox({ position: [(k - w / 2 + (row % 2) * 0.5) * 2 * hx * 1.01, hy + row * 2 * hy, 0], half: [hx, hy, hz] });
+    world.addSphere({ position: [0, 2, 12], radius: 0.9, velocity: [0, 1.5, -22], density: 4 });
+  },
+  'pile'() {
+    const n = +(params.get('n') || 6000);
+    let s = 7;
+    const r = () => { s = (s * 16807) % 2147483647; return s / 2147483647; };
+    for (let k = 0; k < n; k++) {
+      const p = [(r() - 0.5) * 10, 2 + k * 0.012 + r() * 3, (r() - 0.5) * 10];
+      if (r() < 0.75) world.addBox({ position: p, half: [0.15 + r() * 0.2, 0.15 + r() * 0.2, 0.15 + r() * 0.2], rotation: [r() * 3, r() * 3, r() * 3] });
+      else world.addSphere({ position: p, radius: 0.15 + r() * 0.15 });
+    }
+    // a static bowl of walls
+    for (let a = 0; a < 4; a++) {
+      const ang = a * Math.PI / 2, c = Math.cos(ang), sn = Math.sin(ang);
+      world.addBox({ position: [c * 7, 1.5, sn * 7], half: [0.3, 1.5, 7], rotation: [0, ang, 0], static: true });
+    }
+  },
+};
+let current = params.get('scene') || 'pyramid';
+function load(name) { world.clear(); scenes[name](); current = name; Object.assign(view.camera, views[name], { target: [...views[name].target] }); }
+load(current);
+
+SI.panel('Rigid bodies', [
+  { label: 'scene', options: Object.keys(scenes), value: current, onChange: load },
+  { label: 'iterations', min: 1, max: 24, step: 1, value: world.iterations, onInput: (v) => (world.iterations = v) },
+  { label: 'substeps', min: 1, max: 4, step: 1, value: world.substeps, onInput: (v) => (world.substeps = v) },
+  { label: 'reset', onClick: () => load(current) },
+]);
+let shots = 0;
+view.canvas.addEventListener('pointerdown', (e) => {
+  if (!(e.altKey || e.metaKey || e.ctrlKey)) return;
+  const r = view.ray();
+  world.addSphere({ position: SI.v3.add(r.origin, SI.v3.scale(r.dir, 1)), radius: 0.6, velocity: SI.v3.scale(r.dir, 30), density: 3 });
+  shots++;
+});
+view.hud.extra = () => [`bodies ${world.count.toLocaleString()} · contacts ${world.stats.contacts.toLocaleString()} · colours ${world.stats.colors}`];
+setInterval(() => world.readStats(), 500);
+Object.assign(window, { gpu, view, world });
+view.run(() => world.step(1 / 60));
+</script>
+</body>
+</html>

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShaderIntel — galaxy collision (direct N-body)</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="stage">
+  <canvas id="c"></canvas>
+  <div class="info"><b>Direct-summation N-body</b> — every body attracts every other body (N² pairs per step).
+    The kernel is autotuned on your GPU at startup: shared-memory tiling, register blocking and subgroup broadcasts compete.</div>
+</div>
+<script src="common.js"></script>
+<script type="module">
+import * as SI from '../src/index.js';
+
+const params = new URLSearchParams(location.search);
+const gpu = await SI.init();
+const view = gpu.view('#c', { camera: { target: [0, 0, 0], distance: 3.2, pitch: 0.5, yaw: 0.3, far: 500 }, hud: true,
+  bloom: { strength: 0.12 }, background: [0, 0, 0, 1], tonemap: 'aces' });
+
+const count = +(params.get('n') || 65536);
+const sim = gpu.nbody({ count, softening: 0.025, dt: 0.0025 });
+sim.galaxies();
+const tuned = await sim.autotune({ cache: !params.has('retune') });
+const best = tuned[0];
+const pts = gpu.points({ data: sim.pos, size: 0.004, pixelSize: 1.2, colorBy: 'constant', color: [1.0, 0.72, 0.45], intensity: 0.9 });
+view.add({ draw(pass, v) { pts.bind({ P: sim.pos }).draw(pass, v); } });
+
+let stepsPerFrame = 1;
+SI.panel('N-body', [
+  { label: 'steps/frame', min: 0, max: 8, step: 1, value: 1, onInput: (v) => (stepsPerFrame = v) },
+  { label: 'dt', min: 0.0005, max: 0.006, step: 0.0005, value: sim.dt, onInput: (v) => (sim.dt = v) },
+  { label: 'brightness', min: 0.1, max: 4, step: 0.05, value: 0.9, onInput: (v) => pts.set({ intensity: v }) },
+  { label: 'restart', onClick: () => sim.galaxies({ seed: (Math.random() * 1e6) | 0 }) },
+  { html: `${count.toLocaleString()} bodies · best kernel <b>${best.variant.mode} wg=${best.variant.wg} K=${best.variant.K}</b><br>` +
+      tuned.slice(0, 6).map((r) => `${r.variant.mode}/${r.variant.wg}/K${r.variant.K}: ${r.gips.toFixed(0)} G pairs/s`).join('<br>') },
+]);
+view.hud.extra = () => [`${(count * count * stepsPerFrame / 1e9).toFixed(1)} G pair interactions / frame`];
+Object.assign(window, { gpu, view, sim, tuned });
+view.run(() => { if (stepsPerFrame) sim.step(stepsPerFrame); });
+</script>
+</body>
+</html>

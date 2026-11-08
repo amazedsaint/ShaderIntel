@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShaderIntel — 3D smoke and fire</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="stage">
+  <canvas id="c"></canvas>
+  <div class="info"><b>Eulerian smoke &amp; fire</b> — semi-Lagrangian advection on 3D textures (hardware trilinear), vorticity confinement,
+    buoyancy, red–black SOR pressure projection; volume-rendered with precomputed light transmittance. <kbd>alt</kbd>/<kbd>⌘</kbd>-drag moves the source.</div>
+</div>
+<script src="common.js"></script>
+<script type="module">
+import * as SI from '../src/index.js';
+
+const params = new URLSearchParams(location.search);
+const gpu = await SI.init();
+const view = gpu.view('#c', { camera: { target: [0, 0.7, 0], distance: 2.9, pitch: 0.15, yaw: 0.5 }, hud: true, bloom: { strength: 0.06 } });
+view.add(gpu.stage({ height: 0 }));
+
+const res = +(params.get('res') || 80);
+const smoke = gpu.smoke({ res, size: [1, 1.5, 1], iterations: 20 });
+const src = smoke.sources[0];
+const presets = {
+  fire: { temperature: 2.2, density: 2.5, emission: 6, tint: [0.55, 0.5, 0.48], buoyancy: 2.2, cooling: 1.6 },
+  smoke: { temperature: 1.0, density: 3.5, emission: 0, tint: [0.92, 0.94, 0.97], buoyancy: 1.4, cooling: 0.5 },
+};
+const vol = gpu.volume({ smoke });
+view.add(vol);
+function apply(name) {
+  const p = presets[name];
+  src.temperature = p.temperature; src.density = p.density;
+  smoke.buoyancy = p.buoyancy; smoke.cooling = p.cooling;
+  vol.set({ emission: p.emission, tint: p.tint });
+}
+apply('fire');
+SI.panel('Smoke', [
+  { label: 'preset', options: ['fire', 'smoke'], onChange: apply },
+  { label: 'vorticity', min: 0, max: 1.5, step: 0.01, value: smoke.vorticity, onInput: (v) => (smoke.vorticity = v) },
+  { label: 'buoyancy', min: 0, max: 4, step: 0.05, value: smoke.buoyancy, onInput: (v) => (smoke.buoyancy = v) },
+  { label: 'SOR sweeps', min: 0, max: 80, step: 1, value: smoke.iterations, onInput: (v) => (smoke.iterations = v) },
+  { label: 'density', min: 5, max: 80, step: 1, value: 30, onInput: (v) => vol.set({ density: v }) },
+  { label: 'reset', onClick: () => smoke.reset() },
+  { html: `${smoke.dims.join('×')} grid (${(smoke.dims.reduce((a, b) => a * b) / 1e6).toFixed(2)} M cells) · try <a href="?res=128">res=128</a>` },
+]);
+Object.assign(window, { gpu, view, smoke, vol });
+view.run(({ dt, time }) => {
+  const p = view.pointer;
+  if (p.down && (p.alt || p.ctrl)) {
+    const r = view.ray();
+    const t = -r.origin[2] / r.dir[2];
+    if (t > 0) { const q = SI.v3.add(r.origin, SI.v3.scale(r.dir, t)); src.center = [Math.max(-0.4, Math.min(0.4, q[0])), Math.max(0.08, Math.min(1.2, q[1])), 0]; }
+  }
+  smoke.step(dt);
+});
+</script>
+</body>
+</html>
