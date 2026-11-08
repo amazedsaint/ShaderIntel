@@ -4,3 +4,6 @@ node_modules/
 /coverage/
 packages/*/node_modules/
 .claude/
+packages/react/dist/
+packages/react/test/build/
+_site/

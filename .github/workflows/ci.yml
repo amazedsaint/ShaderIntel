@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Unit tests, types and builds (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      # CPU-only: layouts, the WGSL linker, the wire codec, React server rendering, dist freshness,
+      # module syntax, the examples registry. The GPU suites need a GPU: run `npm test` locally.
+      - run: npm run test:unit
+      - run: npm run typecheck
+      - name: Build, and fail if committed bundles are stale
+        run: |
+          npm run build
+          git diff --exit-code -- dist examples/react/build || (echo "::error::Commit the rebuilt bundles (npm run build)." && exit 1)

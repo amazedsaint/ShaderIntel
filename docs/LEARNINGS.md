@@ -361,3 +361,101 @@ Hardware for all numbers: Apple M2 Max (30-core GPU, Metal 3), Chrome 152 / Dawn
 - **Confluence by construction**: interaction-net runtimes (HVM for Bend) get order-independence from
   their semantics; here it comes from sorted lists, prefix-sum allocation, double buffering and
   integer atomics — and is then checked, not assumed.
+
+## Production hardening (0.3.0)
+
+Three independent reviews of the code (physics, rendering and primitives, networking / neural
+networks / types) found about fifty defects that 114 passing tests had not; most were then confirmed
+on the GPU and each fix got a regression test. What they had in common:
+
+- **A ring buffer that flushes when it is full cannot flush inside a render pass.** The uniform ring
+  submitted the batch when its 1 MB filled up — fine between compute dispatches, but a frame with
+  thousands of draws would finish the encoder with the render pass still open. It grows by segments
+  now (each bind group names its segment), which also avoids mid-batch submits.
+- **`queue.writeBuffer` lands before everything not yet submitted** — the same pitfall as above, in
+  new places: per-step collider and source uploads (several steps in one batch all saw the last
+  data) and re-initialisation after a recorded step (`NBody.galaxies()` was overwritten by the step).
+  `writeOrdered()` records the upload as a copy in the command stream; resets flush first.
+- **Destroying a buffer that recorded work still uses fails the entire submit**, silently dropping
+  every other dispatch in it (an unrelated n-body step vanished when a cloth was destroyed).
+  `destroy()` submits first. Stepping a destroyed object recorded half a step and poisoned the batch
+  the same way; it throws now, and layers skip sources that were destroyed.
+- **Device limits in the wild are lower than on development machines.** The rigid solver binds 10
+  storage buffers in one kernel (about 2% of devices allow fewer, a quarter of Firefox installs) and
+  its fused solve needs 18 KB of workgroup memory (about 1% have 16 KB). Both used to fail silently,
+  taking whole frames with them. Check `device.limits` against what each kernel needs, and fail with
+  a message (web3dsurvey.com lists the distribution of every limit).
+- **Subgroups are not always 32 wide.** Two-level subgroup reductions need
+  workgroup / subgroupSize ≤ subgroupSize; Intel GPUs can run 8-wide subgroups, where both the
+  reduction and the scan were wrong. Size from `subgroupMinSize`, or take the portable path.
+- **Degenerate inputs are where NaN comes from**: Poisson's ratio 0.5 (λ through E is 0/0 — split
+  the P-wave modulus directly), zero softening (a body's force on itself is 0·∞), `step(0)`, a cloth
+  one particle wide, a central difference at the screen border (the clamped neighbour is the pixel
+  itself). Bloom then spreads one NaN pixel over a blotch; its first pass drops non-finite values with
+  an integer test (`x != x` may be folded away by compilers that assume no NaN).
+- **Units leak through APIs**: MPM stores velocities in cells per substep, so changing `substeps`
+  at run time changed every particle's speed until they were rescaled; densities written in kg/m³
+  (1000) instead of relative to water overflow the 2²² fixed-point grid.
+- **An invalid index is clamped, not rejected, on the GPU**: `setVelocity(-1, …)` (−1 is what a full
+  world returns) moved the last body. Validate ids on the CPU.
+- **A certificate with fixed randomness certifies nothing against a bad input**: Freivalds' check
+  reused the same eight ±1 vectors, and with N > 2⁸ columns some always share a sign pattern — a
+  product with two swapped columns passed. Fresh random bits per call restore the 2⁻ᵗ bound.
+- **A checker that never looks somewhere cannot fail there**: the backprop law sampled only weights,
+  so a zeroed bias gradient passed; sampling also tied the layer to the index. Sample every tensor
+  with independent draws, and test the checker against a sabotaged implementation.
+- **Data from the network is input, not state**: any peer could send a state that the authority
+  adopted, and `decode` would construct any global a message named. Validate the sender, the epoch
+  and the shape of every message; construct only whitelisted types.
+- **`setTimeout` reorders messages whose delays differ by less than a millisecond**, so a
+  "reliable, ordered" simulated channel was neither under load. Sequence numbers fix it.
+- **String length is not byte length**: chunks sized in UTF-16 units exceeded the 64 KB data-channel
+  part size once encoded (JSON escapes, non-ASCII). Encode to bytes, then split.
+- **A tool that is wrong silently is worse than one that fails**: the regex bundler exported only
+  the first name of `export const A = 0, B = 1`, and an import with a trailing comment broke the
+  bundle. It now rejects every form it does not understand. `new URL(...).pathname` keeps `%20`
+  (build scripts failed in folders with spaces: use `fileURLToPath`), and a path guard of
+  `startsWith(root)` lets `root + '-other'` through.
+
+## React integration
+
+- **StrictMode mounts, unmounts and mounts again.** Creating GPU objects in effects would make every
+  value `undefined` on the first render, and destroying in cleanup would destroy what the second
+  mount uses. `useDisposable` creates during render (so a kernel can bind an array made one line
+  earlier) and destroys a tick after cleanup, cancelled if the component mounts again at once; an
+  object destroyed while a subtree was hidden is re-created when it shows.
+- **Devices are pooled with a linger.** Two canvases with the same options share one device, which
+  is destroyed 1.5 s after the last one unmounts — so StrictMode, route changes and fast refresh
+  reuse it instead of creating and destroying devices (~100 ms each).
+- **Children's effects run before their parent's**, so `<Physics>` creates its world during render;
+  bodies add themselves in layout effects, joints wait for their bodies' ids (they may be written
+  before them) and resolve before the next step.
+- **A fixed-step solver must be stepped at a fixed rate.** `MPM.step()` advances 1/60 s; stepping
+  it once per display frame ran fluids at twice the speed on 120 Hz screens, and a coupled fluid
+  drifted out of lockstep with the world's fixed-step accumulator. A coupled fluid now steps inside
+  the world's loop, once per world step.
+- **Refs are set to null on unmount**: a test that checks objects after unmounting must capture them
+  first. React's StrictMode double-invocation only exists in the development build, so the React
+  test bundle uses it (and the examples use the production build).
+- `react-dom/server` bundled as ESM for Node needs `require` (it loads `util`): an esbuild banner
+  with `createRequire` provides it.
+
+## Website
+
+- **Every image is a real screenshot**: `tools/thumbnails.mjs` runs each example headless at
+  1280×800, hides the UI overlays with injected CSS and saves 640×400 JPEGs (about 30 KB each).
+- **Author styles beat the `hidden` attribute**: `.poster { display: block }` showed a hidden image
+  (and its alt text) until `[hidden] { display: none !important }` was added. Likewise `.btn` declared
+  after `.menu-btn` made a mobile-only button appear on desktop.
+- **A live hero must not hijack the page**: no orbit controls (they capture the wheel), the pointer
+  stirs the water instead, the loop pauses when scrolled out of view, and visitors without WebGPU or
+  asking for reduced motion get a still image.
+
+## Process
+
+- **The runner waited 15 minutes on a syntax error**: a page whose module fails to load never sets
+  its results. It now fails 5 s after the first page error. A comment inserted mid-line once commented
+  out the rest of an object literal; the unit tests now parse every module (`node --check`).
+- **Review by independent readers found what tests did not**: each reviewer read a third of the code
+  with the instruction to confirm suspicions on the GPU and to list which resources every class owns
+  — the inventory that made correct `destroy()` methods possible.

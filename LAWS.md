@@ -3,7 +3,7 @@
 The properties ShaderIntel promises, each with the checker that verifies it. This file plays the
 role Bend 2 gives `LAWS.bend` ("AGENTS.md backed by proof"): it is the specification, and every
 line is executable — `SI.verify.proveAll(gpu, SI)` runs them all (the suite in `tests/` does so on
-every run, see `tests/laws.test.js`), the way `bend PROOF.bend` checks a project before it ships.
+every run, see the "laws" section of `tests/systems.test.js`), the way `bend PROOF.bend` checks a project before it ships.
 
 The checkers live in `src/verify/index.js`. They are the small trusted base: a few lines of plain
 WGSL or JavaScript each, sharing no code with the optimised kernels they judge (as Lean's kernel
@@ -14,14 +14,14 @@ or a **physical law** with a tolerance — the column says which.
 | Law | Statement | Checker | Kind |
 |---|---|---|---|
 | `scan` | `Scan.run` computes an exclusive prefix sum: s₀ = 0 and s[k+1] − s[k] = a[k] | `checkScan` | exact |
-| `gemm` | `gemm` computes C = A·B | `freivalds` — A(Br) = Cr for random ±1 vectors r | probabilistic: false accept ≤ 2⁻⁸ with 8 trials |
+| `gemm` | `gemm` computes C = A·B | `freivalds` — A(Br) = Cr for random ±1 vectors r, fresh on every call | probabilistic: false accept ≤ 2⁻⁸ with 8 trials |
 | `gemm-rejects` | the certificate rejects a product with one corrupted entry | `freivalds` | exact (one entry ≥ 10⁻⁴ of its row's L2 norm is always caught) |
 | `colouring` | no two dynamic bodies of one colour share a contact or a joint (what makes parallel Gauss–Seidel race-free) | `checkColoring` | exact |
-| `contacts` | contact forces push (λₙ ≤ 0), friction stays in the isotropic Coulomb cone (‖λₜ‖ ≤ μ\|λₙ\|), and a settled 600-body pile of 20–60 g bodies penetrates less than 2 cm at 8 iterations | `checkContacts` | sign and cone exact; penetration with a tolerance (heavy-on-light stacks need substeps — see LEARNINGS) |
+| `contacts` | contact forces push (λₙ ≤ 0), friction stays in the isotropic Coulomb cone (‖λₜ‖ ≤ μ\|λₙ\|), and a settled 600-body pile of 20–60 g bodies penetrates less than 2 cm at 8 iterations | `checkContacts` | sign and cone up to f32 rounding (10⁻⁶ absolute, 10⁻³ relative); penetration with a tolerance (heavy-on-light stacks need substeps — see LEARNINGS) |
 | `determinism` | a deterministic `RigidWorld` is a function of its inputs: two runs give bit-identical 64-bit state hashes | `checkDeterminism` | exact (same device, browser and driver) |
 | `replay` | `restore(snapshot)` followed by the same steps reproduces the same state | `checkReplay` | exact |
 | `mpm-conservation` | MLS-MPM particle-to-grid transfer conserves mass and momentum | `checkMPM` | exact up to the 2⁻²² fixed point |
-| `backprop` | `MLP.backward` equals the central finite-difference gradient of the MSE loss | `checkGradient` | numerical (5% relative, f32) |
+| `backprop` | `MLP.backward` equals the central finite-difference gradient of the MSE loss, for every weight and bias tensor | `checkGradient` | numerical (5% relative, f32) |
 
 Further laws are checked by the test suite against analytic physics rather than by a checker
 object: a pendulum's period (2π√(I/mgL), within 1%), a box on a 40° slope sliding at

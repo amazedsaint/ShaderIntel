@@ -13,6 +13,7 @@ modules with no dependencies.
 - [8. three.js](#8-threejs--sithree)
 - [9. Shader library reference](#9-shader-library-reference)
 - [10. First-principles design notes](#10-first-principles-design-notes)
+- [11. React](#11-react)
 
 ---
 
@@ -30,6 +31,15 @@ Requests every useful optional feature the adapter offers (`subgroups`, `shader-
 `timestamp-query`, `float32-filterable`, …) and the adapter's maximum limits (storage buffer size,
 workgroup storage, …). Pass `{ subgroups: false }` etc. to force the portable code paths.
 
+`init()` rejects with an `SI.SIError` whose `code` says why: `'unsupported'` (no WebGPU in this
+browser), `'no-adapter'` (WebGPU is there but no GPU is available) or `'no-device'`.
+`SI.isSupported()` answers the first question without starting anything. Every error ShaderIntel
+throws on purpose is an `SIError`; the codes `'compile'` (WGSL errors, with source lines) and
+`'invalid-argument'` cover most of the rest.
+
+`init({ device, adapter })` wraps a device created elsewhere (three.js's, say) instead of requesting
+one; `destroy()` then leaves that device alive.
+
 ### 1.2 GPU arrays — `gpu.array(type, lengthOrData, opts)`
 
 ```js
@@ -39,6 +49,11 @@ pos.write(float32Array, elementOffset);            // vec3 data is padded to its
 const data = await pos.read();                     // typed array (keeps padding); readPacked() drops it
 gpu.clear(pos); gpu.fill(ids, 7); gpu.fillFloat(pos, 1.5); gpu.copy(a, b);
 ```
+
+`write()` throws if the data does not fit. It goes through `queue.writeBuffer`, which lands before
+any work recorded but not yet submitted; `arr.writeOrdered(data)` instead records the upload in the
+command stream, so dispatches recorded before it see the old contents and those after it the new
+(simulations upload their colliders and sources this way, once per step).
 
 Types follow WGSL host-shareable layout exactly (`f32 i32 u32 f16 vecNf/i/u/h matCxRf`). Arrays carry
 `STORAGE | COPY_SRC | COPY_DST` (+ `opts.usage`). Any array can be bound under a *different* WGSL element
@@ -117,6 +132,20 @@ The linker resolves dependencies, emits each module once and hoists `enable` / `
 `await arr.read()`, `await arr.readPacked()`, `await gpu.readTexture(tex)` (r32float, rgba16float,
 rgba32float, rgba8unorm, … — half floats are expanded).
 
+### 1.7 Lifecycle
+
+Everything that allocates GPU memory has an idempotent `destroy()`: arrays, kernels' helpers,
+primitives (`Scan`, `Reduce`, `SpatialGrid`), every simulation (`RigidWorld`, `MPM`, `Cloth`,
+`Smoke`, `NBody`, `Boids`), every layer, every network and optimiser. An object frees what it
+allocated itself, never what it was given: a `Points` layer does not free the array it draws, and
+snapshots from `world.snapshot()` belong to the caller. `destroy()` first submits recorded work
+that may still use the memory (a destroyed buffer would make the whole submit fail); using an
+object after `destroy()` throws an `SIError`, and layers whose source was destroyed draw nothing.
+
+`view.destroy()` stops the loop, removes its listeners, resize observer and HUD, unconfigures the
+canvas and frees its textures; `view.destroy({ layers: true })` destroys the attached layers too.
+`gpu.destroy()` releases the device and with it everything made on it.
+
 ---
 
 ## 2. Rendering
@@ -132,7 +161,18 @@ const view = gpu.view('#c', {
 view.add(layer);
 view.run(({ dt, time, frame, view }) => { /* record simulation work */ });
 const { origin, dir } = view.ray();       // world ray under the pointer; view.pointer has buttons/modifiers
+view.stop(); view.run();                  // pause and resume (one loop per view)
+view.setBloom({ strength: 0.1 }); view.setHud(false); view.setPixelRatio(1);
+view.camera.set({ target: [0, 1, 0], distance: 5, autoRotate: 0.2 });
+view.destroy();
 ```
+
+`opts.onError(e)` receives errors thrown by the frame callback or rendering (the loop stops); by
+default they are shown over the canvas. `view.onFrame` is the per-frame callback that `run(fn)` sets
+and `view.step(dt)` calls, for driving frames by hand. Camera options also include `minPitch`,
+`maxPitch`, `damping`, `rotateSpeed`, `zoomSpeed`, `panSpeed` and `enabled`. The device-pixel ratio
+follows the screen (moving a window between displays) unless `pixelRatio` is fixed, and the
+drawing buffer is capped at the device's texture limit.
 
 Frame: `prepare(view)` hooks (compute) → HDR scene pass (`rgba16float` + `depth32float`), every
 layer's `draw(pass, view)` → `afterScene(view)` hooks (screen-space effects) → bloom → tonemap with
@@ -215,7 +255,12 @@ view.add(sim.spheres({ solidsOnly: true })); view.add(sim.fluid());
 
 Materials (`MATERIALS`): `water oil honey` (fluid), `jelly rubber` (Neo-Hookean), `snow`
 (Stomakhin 2013), `sand` (Drucker–Prager, Klár 2016), or your own `{ kind, density, stiffness,
-poisson, viscosity, hardening, compression, stretch, friction }`.
+poisson, viscosity, hardening, compression, stretch, friction }`, where `kind` is 0–3 or a name from
+`MPM_KINDS` (`'fluid'`, `'jelly'`, `'snow'`, `'sand'`). Densities are relative to water (at most 50:
+the fixed-point grid would overflow near 300), Poisson's ratio is clamped to [0, 0.49] and viscosity
+to its stable limit. At most 8 materials exist at once; `clear()` forgets them. `substeps` and
+`timeScale` can change at any time: particle velocities are stored per substep, so they are
+rescaled to keep their physical speed. `sim.decouple()` ends a coupling made by `couple()`.
 
 **Math, in lattice units** (`dx = 1`, `Δt = 1`, positions in cells, velocities in cells/substep):
 
@@ -313,7 +358,8 @@ await world.readBodies();        // { position, rotation, velocity, angularVeloc
 ```
 
 Every edit is a queued command applied on the GPU at the start of the next step, so it is cheap and
-ordered with the simulation: `setPose`, `setVelocity`, `applyImpulse(id, J, point)`, `applyForce`,
+ordered with the simulation (an id that does not exist throws: on the GPU it would land on another
+body): `setPose`, `setVelocity`, `applyImpulse(id, J, point)`, `applyForce`,
 `applyAngularImpulse`, `moveKinematic(id, position, rotation)` (kinematic bodies follow a path and
 push dynamic ones), `setFilter(id, group, mask)` (bodies collide when `a.group & b.mask` and
 `b.group & a.mask`), `setEnabled`, `setProps({ gravityScale, linearDamping, angularDamping })`,
@@ -331,8 +377,10 @@ and axes are given in world space.
 | `distance` | the distance | `length`, `anchorB`, `rope: true` (only resists stretching), `stiffness` / `damping` (a spring) |
 | `slider` | 2 translations + 3 rotations | `axis`, `limits` (m), `motor` |
 
-`breakForce` (N) on any joint, `collideConnected` (default false), and at run time `setMotor`,
-`setLimits`, `setJointEnabled`; `readJoints()` → `{ broken, force }`.
+`breakForce` (N) on any joint, `collideConnected` (default false), and at run time
+`setMotor(j, speed, maxForce?)` (the force limit defaults to the joint's current one; `speed` null
+turns the motor off), `setLimits(j, lo, hi)` / `setLimits(j, null)`, `setJointEnabled`;
+`readJoints()` → `{ broken, force }`.
 
 **Queries and events.** `raycast([{ origin, dir, maxDistance, mask }])` → `{ hit, body, distance,
 point, normal }` per ray, or `rayQuery(n)` for a reusable GPU query that other kernels can fill and
@@ -351,6 +399,10 @@ its inputs on a given device and browser: no result depends on the order in whic
 pending impulses, last step's contacts for warm starting) and `world.restore(s)` returns to it — the
 basis of rollback netcode (§6). `exportState()` / `importState()` do the same through the CPU for
 save games and network resync.
+
+A world needs 10 storage buffers per shader stage (98% of devices; the constructor throws an
+`SIError` with code `'unsupported'` otherwise), and the fused solve for small worlds needs 18 KB of
+workgroup memory (it falls back to the multi-dispatch solve below that). `step(0)` does nothing.
 
 Solver options (defaults are the tested values): `iterations` 8, `substeps` 1, `alpha` 0.95
 (fraction of an existing overlap kept per step), `beta` 30 (stiffness ramp, in units of m_eff/Δt²
@@ -499,7 +551,8 @@ deterministic, and for a weight gradient over a 65,536-row batch 10.8× faster a
 **Certificate.** `SI.verify.freivalds(gpu, A, B, C, { M, N, K, trials })` checks a product in O(n²):
 for random ±1 vectors r it compares `A(Br)` with `Cr`; a wrong C survives a trial with probability
 ≤ ½, so 8 trials bound a false accept by 2⁻⁸, and one corrupted entry of 10⁻⁴ of its row's norm is
-always caught. The benchmark suite runs it before timing.
+always caught. The vectors are fresh random bits on every call (`seed` makes them reproducible, at
+the price of the bound against adversarial inputs). The benchmark suite runs it before timing.
 
 **Measured** (M2 Max, 2048³): 3.0 TFLOP/s, 2.1× the classic 16×16 shared-memory tiled kernel and
 7.2× the naive one, bit-identical to both (same summation order). WebGPU exposes no matrix units
@@ -519,7 +572,8 @@ await loss.readLoss();                                // only when you want to l
 ```
 
 `Dense` layers fuse bias and activation (`none relu leaky tanh sigmoid sin gelu`) into the GEMM
-epilogue; `backward` computes `dZ = dY ⊙ f′(Z)` from the stored outputs, `dW = Xᵀ dZ`, `db = Σ dZ`
+epilogue (`sin` and `gelu` keep their pre-activation for the backward pass; SIREN initialisation
+folds ω₀ into the weights); `backward` computes `dZ = dY ⊙ f′(Z)` from the stored outputs, `dW = Xᵀ dZ`, `db = Σ dZ`
 (a per-column workgroup reduction) and `dX = dZ Wᵀ`. `fourier: B` prepends Fourier features
 `[x, sin(2ᵏπx), cos(2ᵏπx)]` for `k < B` (Tancik et al. 2020), which lets a small MLP represent high
 frequencies. `Adam` (with weight decay and gradient clipping) and `SGD` (momentum) update in place.
@@ -582,6 +636,14 @@ one transfer (in a duel of about 40 bodies: one state, and 132 KB on the wire fo
 `resync: false` or a `stateHandler` to use your own policy. A peer keeps `inputHistory` (600) ticks of
 inputs so a late state can still be replayed, and asks for a newer one if it cannot.
 
+**Trust.** A peer's packets are validated before they touch the session (unknown players, malformed
+inputs and hashes are dropped and counted in `stats.messagesRejected`). States are adopted only by
+non-authorities, only from the authority and only when newer than the state held, so a peer cannot
+overwrite the authoritative world or move its epoch back; resync requests are honoured at most once
+a second. Game state crosses the wire in the same encoding as inputs, which carries NaN, ±Infinity,
+-0, `undefined`, BigInt, Map, Set, Date, ArrayBuffer and typed arrays exactly — the same values
+`structuredClone` keeps for rollbacks — and `decode` constructs nothing but those types.
+
 **Backpressure.** Each tick's GPU work is fenced; when more than `maxInFlight` (3) ticks are still
 executing, `advance()` waits a tick (`stats.gpuWaits`) instead of letting the queue — and with it the
 latency of every hash and state read-back — grow without bound.
@@ -611,9 +673,10 @@ determinism, replay), probabilistic with a stated bound (Freivalds for GEMM), or
 tolerance (contact sign and friction cone, penetration, MPM conservation, gradient vs finite
 differences) — each law says which.
 
-Use the checkers on your own kernels: `checkScan`, `checkSorted`, `checkPermutation`, `freivalds`,
-`checkColoring(world)`, `checkContacts(world)`, `checkMPM(sim)`, `checkGradient(net, X, T, batch)`,
-`checkDeterminism(makeWorld)`, `checkReplay(world)`.
+Use the checkers on your own kernels: `checkScan`, `checkSorted`, `checkPermutation` (a fingerprint:
+probabilistic), `freivalds`, `checkColoring(world)`, `checkContacts(world)`, `checkMPM(sim)`,
+`checkGradient(net, X, T, batch)` (every weight and bias tensor), `checkDeterminism(makeWorld)`,
+`checkReplay(world)`.
 
 **Binding contracts.** Every storage binding knows the WGSL type it is declared with — structs
 included, parsed from the linked shader with WGSL's layout rules — and `bind()` / `run()` reject a
@@ -631,8 +694,12 @@ import * as TSL from 'three/tsl';
 const renderer = await SI.three.renderer(THREE, gpu, { canvas, antialias: true });  // shares gpu.device
 const bodies = SI.three.bodies({ THREE, TSL, renderer, world, castShadow: true });
 scene.add(bodies.object);
-// every frame: world.step(dt); bodies.update(); renderer.render(scene, camera);
+// every frame: world.step(dt); bodies.update(); gpu.flush(); renderer.render(scene, camera);
 ```
+
+`gpu.flush()` matters: ShaderIntel batches its work until a flush, and three.js submits its own, so
+without it three.js draws stale poses. `bodies.dispose()` / `particles.dispose()` remove the meshes
+and free their geometries. To use three.js's device instead, `SI.init({ device })`.
 
 `bodies.update()` runs one kernel that copies poses from the world's body buffer into three.js
 storage attributes (GPU → GPU, no read-back); TSL position and normal nodes place the instanced box,
@@ -684,3 +751,12 @@ Import modules with `imports: ['noise', ...]` (dependencies follow automatically
    integer-only atomics. Rollback netcode, replays and the `determinism` law follow for free.
 8. **Ship the checker with the code.** Every promise has an executable checker that is smaller than,
    and independent of, the code it judges (LAWS.md); types of GPU bindings are checked at the call.
+
+---
+
+## 11. React
+
+`shaderintel-react` wraps all of this in components and hooks — `<Canvas>`, `useFrame`,
+`useArray`, `useKernel`, `<Physics>` with `<Box>`, `<Sphere>`, `<Joint>`, `<Fluid>`, `<Cloth>`,
+`<Smoke>`, `<Boids>`, `<NBody>`, `<SdfScene>` and more — with GPU memory tied to component
+lifetimes. See [packages/react/README.md](../packages/react/README.md).

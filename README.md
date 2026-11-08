@@ -1,14 +1,26 @@
 # ShaderIntel
 
+[![CI](https://github.com/amazedsaint/ShaderIntel/actions/workflows/ci.yml/badge.svg)](https://github.com/amazedsaint/ShaderIntel/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A zero-dependency WebGPU library for **GPU physics**, **shaders**, **neural networks** and
 **deterministic peer-to-peer games**, with a small JavaScript SDK that writes the WebGPU boilerplate
-for you. Built from first principles: every solver states the math it implements, every optimisation
-was measured on a real GPU, every benchmark verifies its result against a widely used baseline before
-it reports a speed-up, and every promise the library makes is an executable law ([LAWS.md](LAWS.md))
-checked by a small checker that shares no code with what it checks.
+for you — and a [React package](packages/react/README.md) that turns it into components. Built from
+first principles: every solver states the math it implements, every optimisation was measured on a
+real GPU, every benchmark verifies its result against a widely used baseline before it reports a
+speed-up, and every promise the library makes is an executable law ([LAWS.md](LAWS.md)) checked by
+a small checker that shares no code with what it checks.
+
+**[Examples](examples/)** · **[Guide](docs/GUIDE.md)** · **[React](packages/react/README.md)** ·
+**[Laws](LAWS.md)** · **[Learnings](docs/LEARNINGS.md)** · **[Changelog](CHANGELOG.md)**
+
+```bash
+npm install shaderintel            # the library
+npm install shaderintel-react      # React components and hooks
+```
 
 ```js
-import * as SI from './src/index.js';
+import * as SI from 'shaderintel';
 
 const gpu  = await SI.init();                                   // device + capability detection
 const view = gpu.view('#canvas', { bloom: true, hud: true });   // HDR target, orbit camera, loop
@@ -24,6 +36,23 @@ view.add(gpu.points({ data: pos }));
 view.run(({ dt }) => flow.run(1_000_000, { dt }));
 ```
 
+The same idea in React — bodies are components, and their GPU memory lives as long as they do:
+
+```jsx
+import { Canvas, Stage, Physics, Box, Sphere } from 'shaderintel-react';
+
+<Canvas camera={{ target: [0, 1, 0], distance: 8 }} hud>
+  <Stage />
+  <Physics>
+    <Box position={[0, 4, 0]} size={[1, 1, 1]} />
+    <Sphere position={[0.2, 7, 0]} radius={0.5} />
+  </Physics>
+</Canvas>
+```
+
+Without a bundler, import the sources (`src/index.js`) or the single-file build
+(`dist/shaderintel.js`, or `dist/shaderintel.global.js` for a classic script that defines `SI`).
+
 ## What is inside
 
 | Area | What you get |
@@ -34,7 +63,8 @@ view.run(({ dt }) => flow.run(1_000_000, { dt }));
 | **Games & networking** | Deterministic rigid worlds (bit-identical replays from the same inputs, 64-bit GPU state hashes), GPU snapshots and save states; **rollback netcode** (GGPO-style: input delay, prediction, rollback through GPU snapshots, redundant inputs over an unreliable channel, desync detection and automatic resync from the authority's state) over WebRTC or a simulated lossy network, with a bit-exact wire encoding; match **transcripts** that anyone can re-verify. |
 | **Neural networks** | Tiled, autotuned **GEMM** with fused bias + activation and split-K; MLPs with Fourier features, backprop, MSE, Adam/SGD; a **population** of per-agent networks trained by evolution strategies in one dispatch. |
 | **Verification** | [LAWS.md](LAWS.md): the specification, every line executable (`SI.verify.proveAll`) — exact checkers (scan, sort, colouring, determinism, replay), Freivalds certificates for GEMM, physical laws with tolerances; WGSL **binding contracts** that reject mis-sized buffers at the call. |
-| **Interop & typing** | three.js r180+ renders ShaderIntel bodies and particles GPU → GPU on one device; TypeScript declarations in [`types/`](types/shaderintel.d.ts). |
+| **React** | [`shaderintel-react`](packages/react/README.md): `<Canvas>`, hooks, layers, `<Physics>` with bodies and joints, `<Fluid>`, `<Cloth>`, `<Smoke>`, `<Boids>`, `<NBody>`; GPU memory tied to component lifetimes, StrictMode and server rendering handled. |
+| **Interop & typing** | three.js r180+ renders ShaderIntel bodies and particles GPU → GPU on one device (or share three.js's device with `init({ device })`); TypeScript declarations in [`types/`](types/shaderintel.d.ts). |
 | **Shader library** (WGSL modules) | `hash` (PCG family, lowbias32, RNG, R2, IGN) · `noise` (simplex 2D/3D/4D with analytic gradients, Perlin, value, Worley, fBm with exact gradient, ridged, turbulence, curl) · `sdf` (primitives, smooth/boolean/domain operators) · `raymarch` (two-pass cone marching, normals, soft shadows, AO) · `pbr` (GGX, Smith, Schlick, sky) · `color` (sRGB, OKLab/OKLCh, HSV, palettes, turbo/viridis/inferno/magma) · `tonemap` (AgX, ACES, Khronos PBR Neutral, Reinhard, dithered encode) · `linalg` (3×3 Jacobi eigen, SVD, polar) · `math` (rotations, quaternions, bases). |
 | **Rendering** | `View` (HDR, orbit camera, bloom, tonemapping, HUD), sphere impostors, glow points, oriented glyphs, surface meshes, SDF scenes, **screen-space water** (narrow-range filter), **volumetric smoke** (precomputed light transmittance), sky/ground stage. |
 
@@ -44,7 +74,7 @@ Each row runs the technique most code uses today and the ShaderIntel kernel on t
 inputs, checks that the results agree, and times both (best of interleaved batches of ≥ 20 ms GPU work).
 Measured headless with `node tools/headless.mjs bench` on an Apple M2 Max (Chrome 157, Metal) and on
 the NVIDIA GB10 of a DGX Spark (Chrome 155, Linux, Vulkan; a shared machine, so an upper bound).
-Open [`bench/index.html`](bench/index.html) to reproduce on your GPU.
+Open the benchmarks in the [example browser](examples/#bench) to reproduce them on your GPU.
 
 | Benchmark | Baseline (what most code does) | ShaderIntel | M2 Max | GB10 | Check |
 |---|---|---|---|---|---|
@@ -75,59 +105,65 @@ hardware — see [docs/LEARNINGS.md](docs/LEARNINGS.md).
 
 ## Examples
 
-Serve the folder and open `http://localhost:8787/`:
+Run the site locally and open `http://localhost:8787/`:
 
 ```bash
-node tools/serve.mjs
+npm run serve
 ```
+
+The home page runs a live scene; the [example browser](examples/) lists every demo with a
+screenshot and its source, and the [docs](docs/) render the guide, the React docs, the laws and the
+learnings.
 
 | Example | Shows |
 |---|---|
-| [`examples/quickstart.html`](examples/quickstart.html) | the SDK in 30 lines: 1M particles in curl noise |
-| [`examples/mpm.html`](examples/mpm.html) | MLS-MPM water, jelly, rubber, snow, sand; screen-space water surface; push with a ball |
-| [`examples/rigid.html`](examples/rigid.html) | rigid bodies: a 210-box pyramid, a brick wall hit by a cannonball, a 6,000-body pile; alt-click fires balls |
-| [`examples/joints.html`](examples/joints.html) | ragdolls tumbling down stairs, a rope bridge, motorised machines (car, piston, paddle wheel), a wrecking ball through a breakable wall |
-| [`examples/coupling.html`](examples/coupling.html) | rigid bodies floating, sinking and splashing in MPM water; a dam break against crates; balls in sand |
-| [`examples/p2p.html`](examples/p2p.html) | two peers with their own GPU worlds over a simulated lossy network, rollback netcode, matching state hashes; `?webrtc=room` for two tabs |
-| [`examples/neural.html`](examples/neural.html) | an MLP with Fourier features learns an image on the GPU: training and inference every frame |
-| [`examples/three.html`](examples/three.html) | ShaderIntel physics rendered by three.js (shadows, materials) on the same GPU device, poses copied GPU → GPU; loads three.js from a CDN |
-| [`examples/cloth.html`](examples/cloth.html) | XPBD cloth in gusty wind over sphere and box colliders |
-| [`examples/smoke.html`](examples/smoke.html) | 3D smoke and fire, volumetric lighting |
-| [`examples/nbody.html`](examples/nbody.html) | galaxy collision, autotuned O(N²) gravity |
-| [`examples/boids.html`](examples/boids.html) | 131k–1M flocking boids with a predator |
-| [`examples/sdf.html`](examples/sdf.html) | an SDF scene from one `map()` function, cone-marched with soft shadows and AO |
-| [`examples/noise.html`](examples/noise.html) | domain warping, terrain lit by analytic noise gradients, Worley, curl flow, fire |
-| [`bench/index.html`](bench/index.html) | the benchmark suite above |
-| [`tests/index.html`](tests/index.html) | 114 tests: primitives vs CPU, noise gradients vs finite differences, conservation laws, rigid-body friction, stacking, joints and rolling, GEMM and backprop, buoyancy, two peers over a lossy network, every law in LAWS.md |
+| [`quickstart`](examples/quickstart.html) | the SDK in 30 lines: 1M particles in curl noise |
+| [`mpm`](examples/mpm.html) | MLS-MPM water, jelly, rubber, snow, sand; screen-space water surface; push with a ball |
+| [`rigid`](examples/rigid.html) | rigid bodies: a 210-box pyramid, a brick wall hit by a cannonball, a 6,000-body pile; alt-click fires balls |
+| [`joints`](examples/joints.html) | ragdolls tumbling down stairs, a rope bridge, motorised machines, a wrecking ball through a breakable wall |
+| [`coupling`](examples/coupling.html) | rigid bodies floating, sinking and splashing in MPM water; a dam break against crates; balls in sand |
+| [`p2p`](examples/p2p.html) | two peers with their own GPU worlds over a simulated lossy network, rollback netcode, matching state hashes; `?webrtc=room` for two tabs |
+| [`neural`](examples/neural.html) | an MLP with Fourier features learns an image on the GPU: training and inference every frame |
+| [`three`](examples/three.html) | ShaderIntel physics rendered by three.js (shadows, materials) on the same GPU device; loads three.js from a CDN |
+| [`cloth`](examples/cloth.html), [`smoke`](examples/smoke.html) | XPBD cloth in gusty wind; 3D smoke and fire with volumetric lighting |
+| [`nbody`](examples/nbody.html), [`boids`](examples/boids.html) | galaxy collision with autotuned O(N²) gravity; 131k–1M flocking boids |
+| [`sdf`](examples/sdf.html), [`noise`](examples/noise.html) | an SDF scene from one `map()` function; domain warping, terrain lit by analytic noise gradients |
+| [React examples](examples/react/src) | a physics playground, fluid with crates, a live shader editor, compute with hooks, simulations as components |
 
-## Testing from a terminal
-
-The test suite, the benchmarks and any experiment run headless in Chrome, driven over the DevTools
-protocol by a zero-dependency script (Node 22+):
+## Development
 
 ```bash
-node tools/serve.mjs &
-node tools/headless.mjs tests            # the 114 tests; exit code 1 on any failure
-node tools/headless.mjs bench            # the verified benchmarks
-node tools/headless.mjs info             # adapter, features and limits WebGPU reports
-npm run typecheck                        # the TypeScript declarations, compiled against a typed usage file
+npm install                 # dev tools only (TypeScript, esbuild, React for the wrapper and its examples)
+npm run serve               # the site, examples and tests at http://localhost:8787/
+npm test                    # CPU unit tests, then the GPU suites headless in Chrome (needs a GPU and the server)
+npm run test:unit           # CPU unit tests only (what CI runs)
+npm run build               # dist/ bundles, the React package, the React example bundles
+npm run typecheck           # the declarations and the React package
+npm run thumbnails          # re-shoot the example screenshots and the home page still
+npm run bench               # the verified benchmarks
 ```
 
-On Linux with an NVIDIA GPU, `tools/docker/run.sh tests` does the same with Chrome on Vulkan; that
-is how the suite runs on a DGX Spark (GB10). `tools/docker/Dockerfile` is the matching container
-recipe — see docs/LEARNINGS.md for why Chrome's WebGPU currently has to run on the host there.
+The GPU suites (`tests/`, 138 tests, and `packages/react/test/`, 13) run in headless Chrome driven over
+the DevTools protocol by `tools/headless.mjs` (Node 22+, no dependencies). On Linux with an NVIDIA
+GPU, `tools/docker/run.sh tests` does the same with Chrome on Vulkan; that is how the suite runs on a
+DGX Spark (GB10). `tools/docker/Dockerfile` is the matching container recipe — see
+[LEARNINGS](docs/LEARNINGS.md) for why Chrome's WebGPU currently has to run on the host there.
+Commit `dist/` with your change: a unit test checks that it matches a fresh build.
 
 ## Requirements
 
 WebGPU: Chrome / Edge 113+, Safari 26+, or Firefox 141+ on Windows, served from `http://localhost` or
 https. Subgroups, `shader-f16` and timestamp queries are used when present and fall back to portable
-code paths when not (the test suite runs both).
+code paths when not (the test suite runs both). `RigidWorld` needs 10 storage buffers per shader
+stage (98% of devices); it throws an `SIError` with code `unsupported` where that is missing.
+`SI.isSupported()` and `init()`'s error codes let a page show its own fallback.
 
 ## Layout
 
 ```
 src/
-  core/      context (device, batching, uniform ring), kernel builder + binding contracts, GPU arrays, WGSL linker, types, profiler
+  core/      context (device, batching, uniform ring, ordered writes), kernel builder + binding contracts, GPU arrays,
+             WGSL linker, types, profiler, errors, dispose
   prims/     scan, reduce, spatial grid
   shaders/   WGSL library modules: math, hash, noise, sdf, raymarch, color + tonemap, pbr, linalg
   physics/   mpm, rigid (AVBD: bodies, joints, narrowphase, rays), coupling (fluid ↔ rigid), cloth, smoke, nbody, boids
@@ -137,17 +173,13 @@ src/
   verify/    checkers and the executable laws
   interop/   three.js
   ui.js      tiny control panel for examples
-types/       TypeScript declarations      LAWS.md   the specification, as executable laws
-examples/    HTML demos                   bench/    benchmark suite + baselines
-tests/       browser test suite           docs/     GUIDE.md (API + math), LEARNINGS.md
-tools/       serve.mjs (static server), build.mjs (single-file bundle -> dist/)
+packages/react/   shaderintel-react (TypeScript sources, dist/, GPU tests)
+types/       TypeScript declarations         LAWS.md   the specification, as executable laws
+examples/    demos, React demos, files.json  site/     the website's styles, scripts and font
+tests/       browser suite + CPU unit tests  docs/     GUIDE.md, LEARNINGS.md and the docs viewer
+bench/       benchmark suite + baselines     tools/    server, bundler, headless runner, thumbnails, docker
 ```
 
-## Documentation
+## License
 
-- [docs/GUIDE.md](docs/GUIDE.md) — API reference and the first-principles derivations behind each solver.
-- [LAWS.md](LAWS.md) — what the library promises, and the checker for each promise.
-- [docs/LEARNINGS.md](docs/LEARNINGS.md) — what was measured, what failed, and WebGPU pitfalls.
-
-`package.json` declares the package (`import * as SI from 'shaderintel'`, or `shaderintel/bundle`
-for the single-file build); it is marked private until a license is chosen.
+[MIT](LICENSE). The site's typeface, Archivo, is under the SIL Open Font License ([`site/fonts/OFL.txt`](site/fonts/OFL.txt)).
