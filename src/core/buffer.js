@@ -1,6 +1,9 @@
 // GArray: a typed GPU array. One storage buffer of `length` elements of a WGSL
 // type (f32, vec4f, u32, mat3x3f, ...) with upload / readback helpers.
 import { layoutOf, arrayCtor } from './types.js';
+import { SIError } from './errors.js';
+
+const err = (msg) => new SIError(msg, 'invalid-argument');
 
 let nextId = 1;
 
@@ -20,7 +23,8 @@ export class GArray {
     this.label = opts.label || `${this.type}[]`;
     const data = typeof lengthOrData === 'number' ? null : lengthOrData;
     this.length = data ? Math.floor(data.length / this.layout.components) : lengthOrData;
-    if (!(this.length > 0)) throw new Error(`ShaderIntel: array length must be > 0 (got ${this.length})`);
+    if (!(this.length > 0) || !Number.isFinite(this.length)) throw err(`array length must be a positive number (got ${this.length})`);
+    this.length = Math.floor(this.length);
     this.byteLength = Math.max(16, Math.ceil((this.length * this.stride) / 16) * 16);
     const GU = GPUBufferUsage;
     this.usage = GU.STORAGE | GU.COPY_SRC | GU.COPY_DST | (opts.usage || 0);
@@ -57,9 +61,27 @@ export class GArray {
           for (let k = 0; k < comps; k++) src[e * slots + k] = data[e * comps + k];
       }
     }
-    const bytes = Math.min(src.byteLength, this.byteLength - elementOffset * this.stride);
-    const aligned = bytes & ~3;
+    if (!(elementOffset >= 0) || elementOffset > this.length)
+      throw err(`${this.label}.write: element offset ${elementOffset} is outside the array (length ${this.length})`);
+    const room = this.byteLength - elementOffset * this.stride;
+    if (src.byteLength > room)
+      throw err(`${this.label}.write: ${src.byteLength} bytes at element ${elementOffset} do not fit (the array has room for ${room} bytes)`);
+    const aligned = src.byteLength & ~3;
     if (aligned > 0) this.ctx.device.queue.writeBuffer(this.buffer, elementOffset * this.stride, src.buffer, src.byteOffset, aligned);
+    return this;
+  }
+
+  /**
+   * Like write(), but ordered with recorded work (see Context.writeOrdered): dispatches recorded
+   * before see the old data, those after see the new. Use it between dispatches of one batch.
+   */
+  writeOrdered(data, elementOffset = 0) {
+    if (!(elementOffset >= 0) || elementOffset > this.length) throw err(`${this.label}.writeOrdered: element offset ${elementOffset} is outside the array`);
+    const Ctor = arrayCtor(this.type);
+    const src = this.slots === this.layout.components ? (data instanceof Ctor ? data : Ctor.from(data)) : null;
+    if (!src) return this.write(data, elementOffset);   // padded types: rare, keep the queue path
+    if (src.byteLength > this.byteLength - elementOffset * this.stride) throw err(`${this.label}.writeOrdered: the data does not fit`);
+    this.ctx.writeOrdered(this, src, elementOffset * this.stride);
     return this;
   }
 
@@ -88,5 +110,13 @@ export class GArray {
     return out;
   }
 
-  destroy() { this.buffer.destroy(); }
+  /** Free the GPU memory now (idempotent); the array must not be used afterwards. */
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    // work recorded but not yet submitted may use this buffer; a destroyed buffer would make the
+    // whole submit fail (every other dispatch in it lost), so submit that work first
+    try { this.ctx.flush(); } catch { /* inside an open render pass: the buffer is destroyed after the frame */ }
+    this.buffer.destroy();
+  }
 }

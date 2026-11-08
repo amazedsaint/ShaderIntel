@@ -10,6 +10,8 @@
 // LAWS.md and run by proveAll() — the analogue of `bend PROOF.bend` before a release.
 
 import { MSELoss } from '../nn/nn.js';
+import { COLOR_ROUNDS } from '../physics/rigid.js';
+import { destroyAll } from '../core/dispose.js';
 
 const verdict = (ok, evidence) => ({ ok, ...evidence });
 
@@ -43,7 +45,7 @@ export async function checkSorted(ctx, keys, n) {
 
 /**
  * a and b hold the same multiset of u32 values: two order-independent fingerprints (sums of
- * independent hashes) must match. A false accept needs a collision in both 32-bit sums.
+ * independent hashes) must match. Probabilistic: a false accept needs a collision in both 32-bit sums.
  */
 export async function checkPermutation(ctx, a, b, n) {
   const fp = ctx.array('u32', 4);
@@ -59,8 +61,12 @@ export async function checkPermutation(ctx, a, b, n) {
 
 /**
  * Freivalds' certificate for C = op(A) op(B): for random ±1 vectors r, compare A(Br) with Cr.
- * O(n²) per trial against the O(n³) product; a wrong C survives a trial with probability ≤ 1/2.
- * o: { M, N, K, transA, transB, trials (default 4), tol (relative to the row's L2 norm, default 1e-4) }
+ * O(n²) per trial against the O(n³) product; a wrong C survives a trial with probability ≤ 1/2,
+ * so the vectors are fresh random bits on every call (fixed vectors could be defeated, and with
+ * N > 2^trials some columns would always share a sign pattern). An error of at least tol times
+ * its row's L2 norm in a single entry is caught by every trial.
+ * o: { M, N, K, transA, transB, trials (default 4), tol (relative to the row's L2 norm, default 1e-4),
+ *      seed (optional: reproducible vectors, which forfeits the guarantee against adversarial C) }
  */
 export async function freivalds(ctx, A, B, C, o) {
   const { M, N, K } = o;
@@ -75,10 +81,13 @@ export async function freivalds(ctx, A, B, C, o) {
   const absvec = ctx.kernel({ name: 'verify-rownorm', buffers: { X: { type: 'f32', access: 'read' }, y: { type: 'f32' } }, uniforms: { cols: 'u32' },
     code: 'var s = 0.0; for (var c = 0u; c < u.cols; c++) { let x = X[i * u.cols + c]; s += x * x; } y[i] = sqrt(s);' });
   let maxRel = 0;
+  const bits = new Uint8Array(N);
+  let seed = o.seed === undefined ? 0 : (o.seed >>> 0) || 1;
   for (let t = 0; t < trials; t++) {
     const rv = new Float32Array(N);
-    let s = (0x9e3779b9 * (t + 1)) >>> 0;
-    for (let k = 0; k < N; k++) { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; rv[k] = s & 1 ? 1 : -1; }
+    if (o.seed === undefined) globalThis.crypto.getRandomValues(bits);
+    else for (let k = 0; k < N; k++) { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; bits[k] = seed; }
+    for (let k = 0; k < N; k++) rv[k] = bits[k] & 1 ? 1 : -1;
     ctx.flush();
     r.write(rv);
     // B r : B is K×N (or N×K transposed)
@@ -87,16 +96,21 @@ export async function freivalds(ctx, A, B, C, o) {
     matvec('verify-mv-c', M, N, false).run(M, { cols: N }, { X: C, v: r, y: Cr });
     absvec.run(M, { cols: N }, { X: C, y: mag });
     const [x, y, m] = [await ABr.read(), await Cr.read(), await mag.read()];
-    for (let k = 0; k < M; k++) maxRel = Math.max(maxRel, Math.abs(x[k] - y[k]) / Math.max(1e-6, m[k], Math.abs(x[k])));
+    // relative to the row's L2 norm only: then an entry off by ≥ tol·‖row‖ is always caught
+    for (let k = 0; k < M; k++) maxRel = Math.max(maxRel, Math.abs(x[k] - y[k]) / Math.max(1e-6, m[k]));
   }
   for (const b of [r, Br, ABr, Cr, mag]) b.destroy();
-  return verdict(maxRel <= tol, { maxRelative: maxRel, trials, falseAcceptBound: 2 ** -trials });
+  return verdict(maxRel < tol, { maxRelative: maxRel, trials, falseAcceptBound: 2 ** -trials });
 }
 
-/** No two dynamic bodies of one colour share a contact or a joint (RigidWorld, after a step). Exact. */
+/**
+ * No two dynamic bodies of one colour share a contact or an active joint (RigidWorld, after a
+ * step). Exact. Disabled or broken joints, and joints of disabled bodies, are ignored, as the
+ * solver ignores them.
+ */
 export async function checkColoring(world) {
   const nc = (await world.cnts.read(8))[1];
-  const colors = await world.color[20 & 1].read(world.count);
+  const colors = await world.color[COLOR_ROUNDS & 1].read(world.count);
   const raw = await world.C[(world.frame - 1) & 1].read(Math.max(1, nc) * 6);
   const u = new Uint32Array(raw.buffer, raw.byteOffset, raw.length);
   const bodies = await world.readBodies();
@@ -110,13 +124,19 @@ export async function checkColoring(world) {
     if ((bodies.flags[a] | bodies.flags[b]) & 6) continue;
     if (colors[a] === colors[b]) conflicts++;
   }
-  for (const j of world.joints) if (dyn(j.b) && m(j.a) > 0 && m(j.b) > 0 && colors[j.a] === colors[j.b]) conflicts++;
+  const { broken } = await world.readJoints();
+  world.joints.forEach((j, k) => {
+    if (!j.enabled || broken[k] || !dyn(j.b) || ((bodies.flags[j.a] | bodies.flags[j.b]) & 4)) return;
+    if (m(j.a) > 0 && m(j.b) > 0 && colors[j.a] === colors[j.b]) conflicts++;
+  });
   return verdict(conflicts === 0, { conflicts, contacts: nc });
 }
 
 /**
- * Contact conditions of the last step (RigidWorld): force sign λ_n ≤ 0, isotropic Coulomb cone
- * |λ_t| ≤ μ|λ_n|, bounded penetration, and complementarity |λ_n|·gap ≈ 0 for separated contacts.
+ * Contact conditions of the last step (RigidWorld): force sign λ_n ≤ 0 and the isotropic Coulomb
+ * cone |λ_t| ≤ μ|λ_n| (up to f32 rounding: 1e-6 absolute, coneTol relative), and bounded
+ * penetration. The complementarity |λ_n|·gap of separated contacts is reported as evidence but is
+ * not part of `ok` (speculative contacts legitimately carry force across a small gap).
  * o: { maxPenetration (m, default 0.02), coneTol (default 1e-3 relative) }
  */
 export async function checkContacts(world, o = {}) {
@@ -173,30 +193,40 @@ export async function checkMPM(sim, tol = 1e-4) {
 }
 
 /**
- * Backpropagation against central finite differences on random parameters (an MLP with
- * relu/tanh/sigmoid/none activations, MSE loss on X → T). Returns the worst relative error.
+ * Backpropagation against central finite differences on random parameters — weights and biases
+ * of every layer, each sample drawing the parameter tensor and the index independently (an MLP,
+ * MSE loss on X → T). Returns the worst relative error.
+ * o: { samples (default 16), eps (default 1e-2), tol (default 0.05), seed }
  */
 export async function checkGradient(net, X, T, batch, o = {}) {
   const ctx = net.ctx, outN = net.layers[net.layers.length - 1].out;
   const loss = new MSELoss(ctx, batch * outN);
-  const lossAt = async () => { net.forward(X, batch); loss.run(net.output, T, batch * outN); return loss.readLoss(); };
-  net.forward(X, batch);
-  net.backward(loss.run(net.output, T, batch * outN), batch);
-  const samples = o.samples ?? 12, eps = o.eps ?? 1e-2;
-  let worst = 0, s = 12345;
-  for (let q = 0; q < samples; q++) {
-    s = (s * 16807) % 2147483647;
-    const l = net.layers[s % net.layers.length];
-    const W = await l.W.read(), G = await l.gW.read();
-    const idx = s % W.length;
-    const w0 = W[idx];
-    W[idx] = w0 + eps; ctx.flush(); l.W.write(W); const lp = await lossAt();
-    W[idx] = w0 - eps; ctx.flush(); l.W.write(W); const lm = await lossAt();
-    W[idx] = w0; ctx.flush(); l.W.write(W);
-    const fd = (lp - lm) / (2 * eps);
-    worst = Math.max(worst, Math.abs(fd - G[idx]) / Math.max(1e-4, Math.abs(fd), Math.abs(G[idx])));
+  try {
+    const lossAt = async () => { net.forward(X, batch); loss.run(net.output, T, batch * outN); return loss.readLoss(); };
+    net.forward(X, batch);
+    net.backward(loss.run(net.output, T, batch * outN), batch);
+    const params = net.params;   // [{ w, g }] — W and b of every layer
+    const samples = o.samples ?? 16, eps = o.eps ?? 1e-2;
+    let worst = 0, s = (o.seed ?? 12345) >>> 0 || 1;
+    const next = () => { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; return (s >>> 0) / 4294967296; };
+    const seen = new Set();
+    for (let q = 0; q < samples; q++) {
+      const pi = q < params.length ? q : Math.floor(next() * params.length);   // every tensor at least once
+      const P = params[pi];
+      const W = await P.w.read(), G = await P.g.read();
+      const idx = Math.floor(next() * W.length);
+      seen.add(pi);
+      const w0 = W[idx];
+      W[idx] = w0 + eps; ctx.flush(); P.w.write(W); const lp = await lossAt();
+      W[idx] = w0 - eps; ctx.flush(); P.w.write(W); const lm = await lossAt();
+      W[idx] = w0; ctx.flush(); P.w.write(W);
+      const fd = (lp - lm) / (2 * eps);
+      worst = Math.max(worst, Math.abs(fd - G[idx]) / Math.max(1e-4, Math.abs(fd), Math.abs(G[idx])));
+    }
+    return verdict(worst < (o.tol ?? 0.05), { maxRelativeError: worst, samples, tensorsChecked: seen.size, tensors: params.length });
+  } finally {
+    loss.destroy();
   }
-  return verdict(worst < (o.tol ?? 0.05), { maxRelativeError: worst, samples });
 }
 
 /** The same build run twice gives bit-identical state hashes (needs a deterministic RigidWorld). */
@@ -214,12 +244,16 @@ export async function checkDeterminism(makeWorld, steps = 120, every = 30) {
 /** snapshot → step n → restore → step n reproduces the same state hash. */
 export async function checkReplay(world, steps = 60) {
   const snap = world.snapshot();
-  for (let s = 0; s < steps; s++) world.step(1 / 60);
-  const a = await world.hash();
-  world.restore(snap);
-  for (let s = 0; s < steps; s++) world.step(1 / 60);
-  const b = await world.hash();
-  return verdict(a === b, { first: a, replay: b });
+  try {
+    for (let s = 0; s < steps; s++) world.step(1 / 60);
+    const a = await world.hash();
+    world.restore(snap);
+    for (let s = 0; s < steps; s++) world.step(1 / 60);
+    const b = await world.hash();
+    return verdict(a === b, { first: a, replay: b });
+  } finally {
+    destroyAll(snap.B, snap.J, snap.ext, snap.C, snap.tbl, snap.cnt);
+  }
 }
 
 /**
@@ -229,66 +263,78 @@ export async function checkReplay(world, steps = 60) {
 export const LAWS = [
   { name: 'scan', statement: 'Scan.run computes an exclusive prefix sum: s[0] = 0, s[k+1] − s[k] = a[k].', async check(gpu, SI) {
     const n = 1 << 18, a = new Uint32Array(n).map((_, k) => (k * 2654435761) % 1000);
-    const A = gpu.array('u32', a), S = gpu.array('u32', n + 1);
-    new SI.Scan(gpu, n + 1).run(A, S, n);
-    return checkScan(gpu, A, S, n);
+    const A = gpu.array('u32', a), S = gpu.array('u32', n + 1), scan = new SI.Scan(gpu, n + 1);
+    try { scan.run(A, S, n); return await checkScan(gpu, A, S, n); } finally { destroyAll(A, S, scan); }
   } },
   { name: 'gemm', statement: 'gemm computes C = A·B (Freivalds certificate, false-accept probability ≤ 2⁻⁸).', async check(gpu, SI) {
     const M = 777, N = 513, K = 1029;
-    const rnd = (n, s) => { const x = new Float32Array(n); for (let k = 0; k < n; k++) { s = (s * 16807) % 2147483647; x[k] = s / 2147483647 - 0.5; } return x; };
     const A = gpu.array('f32', rnd(M * K, 3)), B = gpu.array('f32', rnd(K * N, 7)), C = gpu.array('f32', M * N);
-    SI.nn.gemm(gpu, A, B, C, { M, N, K });
-    return freivalds(gpu, A, B, C, { M, N, K, trials: 8 });
+    try { SI.nn.gemm(gpu, A, B, C, { M, N, K }); return await freivalds(gpu, A, B, C, { M, N, K, trials: 8 }); } finally { destroyAll(A, B, C); }
   } },
   { name: 'gemm-rejects', statement: 'Freivalds rejects a product with a single corrupted entry.', async check(gpu, SI) {
     const M = 300, N = 200, K = 400;
-    const rnd = (n, s) => { const x = new Float32Array(n); for (let k = 0; k < n; k++) { s = (s * 16807) % 2147483647; x[k] = s / 2147483647 - 0.5; } return x; };
     const A = gpu.array('f32', rnd(M * K, 5)), B = gpu.array('f32', rnd(K * N, 9)), C = gpu.array('f32', M * N);
-    SI.nn.gemm(gpu, A, B, C, { M, N, K });
-    const c = await C.read(); c[12345] += 0.5; gpu.flush(); C.write(c);
-    const r = await freivalds(gpu, A, B, C, { M, N, K, trials: 8 });
-    return verdict(!r.ok, { detected: !r.ok, maxRelative: r.maxRelative });
+    try {
+      SI.nn.gemm(gpu, A, B, C, { M, N, K });
+      const c = await C.read(); c[12345] += 0.5; gpu.flush(); C.write(c);
+      const r = await freivalds(gpu, A, B, C, { M, N, K, trials: 8 });
+      return verdict(!r.ok, { detected: !r.ok, maxRelative: r.maxRelative });
+    } finally { destroyAll(A, B, C); }
   } },
   { name: 'colouring', statement: 'No two dynamic bodies of one colour share a contact or a joint.', async check(gpu) {
     const w = gpu.rigid({ maxBodies: 2048 });
-    let s = 7; const r = () => { s = (s * 16807) % 2147483647; return s / 2147483647; };
-    for (let k = 0; k < 1000; k++) w.addBox({ position: [(r() - 0.5) * 5, 0.3 + k * 0.02, (r() - 0.5) * 5], half: [0.2, 0.2, 0.2], rotation: [r(), r(), r()] });
-    for (let k = 0; k < 120; k++) w.step(1 / 60);
-    return checkColoring(w);
+    try {
+      let s = 7; const r = () => { s = (s * 16807) % 2147483647; return s / 2147483647; };
+      for (let k = 0; k < 1000; k++) w.addBox({ position: [(r() - 0.5) * 5, 0.3 + k * 0.02, (r() - 0.5) * 5], half: [0.2, 0.2, 0.2], rotation: [r(), r(), r()] });
+      for (let k = 0; k < 120; k++) w.step(1 / 60);
+      return await checkColoring(w);
+    } finally { w.destroy(); }
   } },
   { name: 'contacts', statement: 'Contact forces push (λ_n ≤ 0), stay in the Coulomb cone (|λ_t| ≤ μ|λ_n|), and a settled 600-body pile of 20–60 g bodies penetrates less than 2 cm (8 iterations; heavier stacks need substeps).', async check(gpu) {
     const w = gpu.rigid({ maxBodies: 2048 });
-    let s = 9; const r = () => { s = (s * 16807) % 2147483647; return s / 2147483647; };
-    for (let k = 0; k < 600; k++) (r() < 0.5 ? w.addBox({ position: [(r() - 0.5) * 4, 0.3 + k * 0.02, (r() - 0.5) * 4], half: [0.2, 0.15, 0.25], rotation: [r(), r(), r()] })
-      : w.addSphere({ position: [(r() - 0.5) * 4, 0.3 + k * 0.02, (r() - 0.5) * 4], radius: 0.18 }));
-    for (let k = 0; k < 360; k++) w.step(1 / 60);
-    return checkContacts(w, { maxPenetration: 0.02 });
+    try {
+      let s = 9; const r = () => { s = (s * 16807) % 2147483647; return s / 2147483647; };
+      for (let k = 0; k < 600; k++) (r() < 0.5 ? w.addBox({ position: [(r() - 0.5) * 4, 0.3 + k * 0.02, (r() - 0.5) * 4], half: [0.2, 0.15, 0.25], rotation: [r(), r(), r()] })
+        : w.addSphere({ position: [(r() - 0.5) * 4, 0.3 + k * 0.02, (r() - 0.5) * 4], radius: 0.18 }));
+      for (let k = 0; k < 360; k++) w.step(1 / 60);
+      return await checkContacts(w, { maxPenetration: 0.02 });
+    } finally { w.destroy(); }
   } },
   { name: 'determinism', statement: 'A deterministic RigidWorld is a function of its inputs: two runs give bit-identical states.', async check(gpu) {
-    return checkDeterminism(() => {
-      const w = gpu.rigid({ maxBodies: 1024, deterministic: true });
-      for (let k = 0; k < 300; k++) w.addBox({ position: [(k % 7) * 0.45 - 1.5, 0.3 + Math.floor(k / 7) * 0.45, (k % 5) * 0.1], half: [0.2, 0.2, 0.2], rotation: [k * 0.1, k * 0.2, 0] });
-      return w;
-    });
+    const made = [];
+    try {
+      return await checkDeterminism(() => {
+        const w = gpu.rigid({ maxBodies: 1024, deterministic: true });
+        made.push(w);
+        for (let k = 0; k < 300; k++) w.addBox({ position: [(k % 7) * 0.45 - 1.5, 0.3 + Math.floor(k / 7) * 0.45, (k % 5) * 0.1], half: [0.2, 0.2, 0.2], rotation: [k * 0.1, k * 0.2, 0] });
+        return w;
+      });
+    } finally { destroyAll(made); }
   } },
   { name: 'replay', statement: 'restore(snapshot) followed by the same steps reproduces the same state.', async check(gpu) {
     const w = gpu.rigid({ maxBodies: 1024, deterministic: true });
-    for (let k = 0; k < 200; k++) w.addSphere({ position: [(k % 5) * 0.5, 0.5 + Math.floor(k / 5) * 0.5, (k % 3) * 0.3], radius: 0.2 });
-    for (let k = 0; k < 30; k++) w.step(1 / 60);
-    return checkReplay(w, 60);
+    try {
+      for (let k = 0; k < 200; k++) w.addSphere({ position: [(k % 5) * 0.5, 0.5 + Math.floor(k / 5) * 0.5, (k % 3) * 0.3], radius: 0.2 });
+      for (let k = 0; k < 30; k++) w.step(1 / 60);
+      return await checkReplay(w, 60);
+    } finally { w.destroy(); }
   } },
   { name: 'mpm-conservation', statement: 'MLS-MPM P2G conserves mass and momentum exactly (fixed-point sums).', async check(gpu) {
     const sim = gpu.mpm({ grid: 32, maxParticles: 50000 });
-    sim.add({ box: [[0.2, 0.2, 0.2], [0.6, 0.6, 0.6]] }, { material: 'water', velocity: [0.3, 0.1, -0.2] });
-    for (let k = 0; k < 10; k++) sim.step();
-    return checkMPM(sim);
+    try {
+      sim.add({ box: [[0.2, 0.2, 0.2], [0.6, 0.6, 0.6]] }, { material: 'water', velocity: [0.3, 0.1, -0.2] });
+      for (let k = 0; k < 10; k++) sim.step();
+      return await checkMPM(sim);
+    } finally { sim.destroy(); }
   } },
-  { name: 'backprop', statement: 'MLP.backward equals the finite-difference gradient of the MSE loss.', async check(gpu, SI) {
+  { name: 'backprop', statement: 'MLP.backward equals the finite-difference gradient of the MSE loss, for every weight and bias tensor.', async check(gpu, SI) {
     const net = new SI.nn.MLP(gpu, { layers: [3, 16, 16, 2], act: 'tanh', out: 'none', maxBatch: 64, seed: 4 });
     const X = gpu.array('f32', new Float32Array(64 * 3).map((_, k) => Math.sin(k * 0.37))), T = gpu.array('f32', new Float32Array(64 * 2).map((_, k) => Math.cos(k)));
-    return checkGradient(net, X, T, 64);
+    try { return await checkGradient(net, X, T, 64); } finally { destroyAll(net, X, T); }
   } },
 ];
+
+function rnd(n, s) { const x = new Float32Array(n); for (let k = 0; k < n; k++) { s = (s * 16807) % 2147483647; x[k] = s / 2147483647 - 0.5; } return x; }
 
 export async function proveAll(gpu, SI, only) {
   const out = [];

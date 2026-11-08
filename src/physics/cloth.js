@@ -16,6 +16,8 @@
 // tethered to its nearest pin by a unilateral constraint |x - x_pin| <= L_rest.
 // Gauss–Seidel spreads a load only a few edges per substep, so a hanging sheet
 // would otherwise sag/stretch under its own weight; one extra dispatch fixes it.
+import { destroyAll } from '../core/dispose.js';
+import { SIError } from '../core/errors.js';
 
 const FAMILIES = [
   // [dx, dy, kind] kind: 0 stretch, 1 shear, 2 bend
@@ -31,6 +33,7 @@ export class Cloth {
   constructor(ctx, o = {}) {
     this.ctx = ctx;
     const W = (this.W = o.width || 128), H = (this.H = o.height || 128);
+    if (!(W >= 2 && H >= 2)) throw new SIError(`Cloth: width and height must be at least 2 particles (got ${W} × ${H})`, 'invalid-argument');
     this.count = W * H;
     this.size = o.size || [1.6, 1.6];
     this.origin = o.origin || [-0.8, 1.6, 0];
@@ -86,6 +89,7 @@ export class Cloth {
         const z = vertical ? this.origin[2] + 0.002 * Math.sin(i * 0.7) : this.origin[2] + (j / (H - 1)) * this.size[1] - this.size[1] / 2;
         p.set([x, y, z, pinFn(i, j) ? 0 : 1], 4 * k);
       }
+    this.ctx.flush();   // a reset must not overtake steps that are recorded but not yet submitted
     this.pos.write(p); this.prev.write(p);
     this.ctx.clear(this.vel);
     // tethers: nearest pinned particle and its rest distance (static pins)
@@ -104,6 +108,13 @@ export class Cloth {
     this.tether.write(teth);
     this.restX = this.size[0] / (W - 1);
     this.restY = this.size[1] / (H - 1);
+  }
+
+  /** Free the cloth's GPU buffers. */
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    destroyAll(this.pos, this.prev, this.vel, this.nrm, this.colBuf, this.tether, this.indices);
   }
 
   _kernels() {
@@ -203,7 +214,7 @@ export class Cloth {
         if (x.y < u.floorY + u.thickness) {
           x.y = u.floorY + u.thickness;
           let dx = x - x0;
-          x.x -= dx.x * u.friction; x.z -= dx.z * u.friction;
+          x.x -= dx.x * min(u.friction, 1.0); x.z -= dx.z * min(u.friction, 1.0);
         }
         pos[i] = vec4f(x, p.w);
         vel[i] = vec4f((x - x0) / u.dt, 0.0);`,
@@ -239,11 +250,13 @@ export class Cloth {
       if (c.type === 'box') data.set([...c.center, 0, ...(c.half || [0.1, 0.1, 0.1]), 1], k * 8);
       else data.set([...c.center, c.radius ?? 0.2, 0, 0, 0, 0], k * 8);
     });
-    this.colBuf.write(data);
+    this.colBuf.writeOrdered(data);   // ordered: several step() calls in one batch each see their own colliders
   }
 
   /** Advance one frame of `frameDt` seconds. */
   step(frameDt = 1 / 60) {
+    if (this.destroyed) throw new SIError('Cloth.step: it was destroyed');
+    if (!(frameDt > 0)) return;   // a zero time step would divide by zero in the velocity update
     const ctx = this.ctx, W = this.W, H = this.H;
     this._uploadColliders();
     const dt = Math.min(frameDt, 1 / 30) / this.substeps;

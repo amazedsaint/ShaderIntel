@@ -2,6 +2,8 @@
 // e.g. max speed of a particle set: new Reduce(ctx, { input: 'vec4f', type: 'f32',
 // op: 'max', map: 'length(x.xyz)' }). The result stays on the GPU (result[0]) so
 // other kernels can consume it without a CPU round trip; read() fetches it.
+import { destroyAll } from '../core/dispose.js';
+import { SIError } from '../core/errors.js';
 
 const IDENT = {
   sum: { f32: '0.0', u32: '0u', i32: '0i' },
@@ -27,7 +29,8 @@ export class Reduce {
     const vecN = /vec([234])/.exec(type)?.[1];
     const ident = vecN ? `${type}(${IDENT[op][scalar]})` : IDENT[op][scalar];
     const combine = op === 'sum' ? 'a + b' : `${op}(a, b)`;
-    const sg = ctx.caps.subgroups;
+    // the two-level subgroup reduction needs 256 / subgroupSize ≤ subgroupSize, i.e. subgroups of 16+
+    const sg = ctx.caps.subgroups && (ctx.caps.subgroupMin || 32) >= 16;
     this.wg = 256;
     this.tile = this.wg * ITEMS;
     this.type = type;
@@ -72,9 +75,14 @@ export class Reduce {
     this.restK = input === type && !o.map ? this.firstK : make(type, 'x', 'reduce-rest');
   }
 
-  /** Reduce the first n elements of src. Returns the 1-element result array (on GPU). */
+  /** Free the reduction's buffers. */
+  destroy() { destroyAll(this.result, this.levels); this.levels = []; }
+
+  /** Reduce the first n elements of src (n = 0 gives the identity). Returns the 1-element result array (on GPU). */
   run(src, n = src.length) {
-    let groups = Math.ceil(n / this.tile);
+    n = Math.max(0, n | 0);
+    if (n > this.maxN) throw new SIError(`Reduce.run: n = ${n} exceeds maxN = ${this.maxN} (pass a larger maxN to the constructor)`, 'invalid-argument');
+    let groups = Math.max(1, Math.ceil(n / this.tile));
     let k = this.firstK, level = 0, cur = src, count = n;
     for (;;) {
       const dst = groups === 1 ? this.result : this.levels[level];

@@ -6,9 +6,11 @@
 //      phase), sky ambient and blackbody-ish emission from temperature.
 // Composited over the HDR scene with premultiplied alpha after the opaque pass.
 import { RenderProgram } from './program.js';
+import { destroyAll } from '../core/dispose.js';
+import { SIError } from '../core/errors.js';
 
 export class Volume {
-  /** o: smoke (Smoke instance), density, absorption, emission, sun, sunColor, ambient, steps */
+  /** o: smoke (Smoke instance), density, emission, tint, sun, sunColor, ambient, g (Henyey–Greenstein anisotropy) */
   constructor(ctx, o) {
     this.ctx = ctx;
     this.smoke = o.smoke;
@@ -95,9 +97,16 @@ export class Volume {
     });
   }
 
-  set(v) { Object.assign(this.values, v); return this; }
+  /** Update density, emission, tint, sun, sunColor, ambient or g; unknown names throw. */
+  set(v) {
+    for (const k of Object.keys(v))
+      if (!(k in this.values)) throw new SIError(`Volume.set: unknown value "${k}" (use ${Object.keys(this.values).join(', ')})`, 'invalid-argument');
+    Object.assign(this.values, v, v.sun ? { sun: norm(v.sun) } : {});
+    return this;
+  }
 
   prepare() {
+    if (this.destroyed || this.smoke.destroyed) return;
     const s = this.smoke, D = s.dims;
     const step = 1.0; // one voxel per light step (in voxel units)
     const sunT = this.values.sun.map((c, a) => (c * step) / D[a]);
@@ -105,6 +114,7 @@ export class Volume {
   }
 
   afterScene(view) {
+    if (this.destroyed || this.smoke.destroyed) return;
     const s = this.smoke;
     const pass = this.ctx.renderPass({ colorAttachments: [{ view: view.hdr.view, loadOp: 'load', storeOp: 'store' }] });
     this.program.draw(pass, view, 3, 1, {
@@ -112,6 +122,7 @@ export class Volume {
     }, { scal: s.scalA, lightT: this.light, depthTex: view.depth });
     pass.end();
   }
+  destroy() { this.destroyed = true; destroyAll(this.light); }
 }
 
 function norm(v) { const l = Math.hypot(...v) || 1; return v.map((x) => x / l); }

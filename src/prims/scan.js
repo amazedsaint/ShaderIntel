@@ -19,6 +19,8 @@
 // Workgroup size keeps (#subgroups <= subgroup size) for every size the adapter
 // can produce.
 import { defineModule } from '../core/wgsl.js';
+import { destroyAll } from '../core/dispose.js';
+import { SIError } from '../core/errors.js';
 
 /** WGSL module 'wgscan': workgroup-wide exclusive scan / reduction of one u32 per thread. */
 defineModule('wgscan', {
@@ -86,9 +88,11 @@ export class Scan {
    */
   constructor(ctx, maxN, o = {}) {
     this.ctx = ctx;
-    const sg = ctx.caps.subgroups;
+    // The workgroup scan has every subgroup scan the subgroup totals, so it needs
+    // workgroup / subgroupSize ≤ subgroupSize for the smallest subgroup size the device may use.
     const minSG = ctx.caps.subgroupMin || 32;
-    this.wg = sg ? Math.max(32, Math.min(256, minSG * minSG)) : 256;
+    const sg = ctx.caps.subgroups && minSG >= 8;
+    this.wg = sg ? Math.min(256, minSG * minSG) : 256;
     this.items = ctx.caps.workgroupStorage >= 20480 ? 16 : 8;
     this.tile = this.wg * this.items;
     this.maxN = maxN;
@@ -278,12 +282,15 @@ export class Scan {
     }
   }
 
+  /** Free the scan's scratch buffers. */
+  destroy() { destroyAll(this.levels, this.dummy, this.status); this.levels = []; }
+
   /**
    * Exclusive scan of the first n u32 of `src` into `dst` (may alias).
    * Elements past n inside the last vec4 are overwritten in dst.
    */
   run(src, dst = src, n = src.length) {
-    if (n > this.maxN) throw new Error(`Scan: n=${n} exceeds maxN=${this.maxN}`);
+    if (n > this.maxN) throw new SIError(`Scan.run: n = ${n} exceeds maxN = ${this.maxN}`, 'invalid-argument');
     const tiles = Math.ceil(n / this.tile);
     if (tiles <= 1) return this._down(1, n, 0, src, dst, this.dummy), dst;
     // In place, a fallback could read a predecessor's tile after its outputs overwrote it:

@@ -81,6 +81,8 @@ export class RollbackSession {
     this.expectEpoch = 0;        // hashes from older epochs describe a history the peer has abandoned
     this.resyncWanted = false;
     this.pendingState = null;
+    this.importTick = -1;        // the tick of the last state adopted from the authority (no rollback reaches before it)
+    this._lastStateSent = -Infinity;
     this.tick = 0;
     this.inputs = Array.from({ length: this.players }, () => new Map());
     this.predicted = Array.from({ length: this.players }, () => new Map());
@@ -92,7 +94,8 @@ export class RollbackSession {
     this.chain = '0000000000000000';
     this.chainTick = -1;
     this.log = { inputs: [], hashes: {} };
-    this.stats = { rollbacks: 0, rolledBackTicks: 0, stalls: 0, desyncs: 0, resyncs: 0, statesSent: 0, statesReceived: 0, exportErrors: 0, gpuWaits: 0, hashesRecorded: 0, hashesDropped: 0, hashesStale: 0, ping: 0, inSyncTick: -1, sent: 0, received: 0 };
+    this.stats = { rollbacks: 0, rolledBackTicks: 0, stalls: 0, desyncs: 0, resyncs: 0, statesSent: 0, statesReceived: 0, statesRejected: 0, exportErrors: 0, gpuWaits: 0,
+      hashesRecorded: 0, hashesDropped: 0, hashesStale: 0, messagesRejected: 0, ping: 0, inSyncTick: -1, sent: 0, received: 0 };
     const zero = new Uint8Array(this.inputSize);
     for (let t = 0; t < this.delay; t++) this.inputs[this.local].set(t, zero);
     this.confirmed[this.local] = this.delay - 1;
@@ -213,12 +216,15 @@ export class RollbackSession {
   // Authority: send the state before tick S, the newest one whose every input is final.
   _sendState() {
     this.resyncWanted = false;
+    // at most one state a second: a peer that keeps asking cannot make us export continuously
+    if (this.tick - this._lastStateSent < Math.round(1 / this.dt)) { this.resyncWanted = true; return; }
     const S = Math.min(this.confirmedTick + 1, this.tick - 1);
     const e = this.ring[S % this.ring.length];
     if (!e || e.tick !== S || !this.sim.exportState) return;
     const epoch = this.remoteEpoch + 1;
     this.expectEpoch = epoch;
     this.stats.statesSent++;
+    this._lastStateSent = this.tick;
     const t0 = performance.now();
     this.sim.exportState(e.snap).then((state) => {
       this.stats.lastExport = { tick: S, ms: Math.round(performance.now() - t0), sentAt: this.tick };
@@ -243,10 +249,13 @@ export class RollbackSession {
       return;
     }
     this.sim.importState(m.state);
-    if (this.game && m.game) this.game.load(structuredClone(m.game));
+    if (this.game && m.game !== undefined) this.game.load(structuredClone(m.game));
     this.epoch = m.epoch;
+    this.importTick = S;
     this.stats.lastResync = { tick: S, appliedAt: this.tick };
     this.rollbackTo = Infinity;
+    // hashes still queued for ticks before the import would hash snapshots of the abandoned history
+    this.pendingHash = this.pendingHash.filter((T) => T >= S - 1);
     // hashes of the abandoned history are recomputed (and re-sent) from the new one
     for (const [T, h] of this.hashes) if (T >= S - 1) { delete h.local; h.reported = false; }
     for (let T = Math.ceil(Math.max(0, S - 1) / this.hashEvery) * this.hashEvery; T < this.tick; T += this.hashEvery)
@@ -281,35 +290,55 @@ export class RollbackSession {
     this.stats.sent++;
   }
 
+  // A message from the network is checked before it touches the session: a malformed or forged
+  // packet is dropped (stats.messagesRejected), never allowed to throw or to index out of range.
+  _validPlayer(p) { return Number.isInteger(p) && p >= 0 && p < this.players && p !== this.local; }
+
   _onInputs(m) {
-    if (m.from === this.local) return;
+    if (!m || m.from === this.local) return;
+    if (!this._validPlayer(m.from) || !Number.isInteger(m.start) || m.start < 0 || !Array.isArray(m.inputs) || m.inputs.length > 4 * this.redundancy) {
+      this.stats.messagesRejected++;
+      return;
+    }
     this.stats.received++;
-    if (m.echo) this.stats.ping = Math.round(performance.now() - m.echo);
-    this._echo = m.sent;
+    if (typeof m.echo === 'number') this.stats.ping = Math.round(performance.now() - m.echo);
+    this._echo = typeof m.sent === 'number' ? m.sent : undefined;
     const p = m.from;
     m.inputs.forEach((arr, k) => {
       const t = m.start + k;
-      if (this.inputs[p].has(t)) return;
+      if (this.inputs[p].has(t) || !Array.isArray(arr) || arr.length !== this.inputSize) return;
       const v = Uint8Array.from(arr);
       this.inputs[p].set(t, v);
-      if (t < this.tick) {
+      // inputs before an adopted state are already part of it: no rollback reaches before the import
+      if (t < this.tick && t >= this.importTick) {
         const pred = this.predicted[p].get(t);
         if (!sameBytes(pred, v)) this.rollbackTo = Math.min(this.rollbackTo, t);
-        this.predicted[p].delete(t);
       }
+      this.predicted[p].delete(t);
     });
     while (this.inputs[p].has(this.confirmed[p] + 1)) this.confirmed[p]++;
   }
 
   _onReliable(m) {
-    if (m.from === this.local) return;
-    if (m.type === 'hash') this._gotHash(m.tick, m.hash, 'remote', m.epoch ?? 0);
+    if (!m || m.from === this.local) return;
+    if (!this._validPlayer(m.from)) { this.stats.messagesRejected++; return; }
+    if (m.type === 'hash') {
+      if (!Number.isInteger(m.tick) || typeof m.hash !== 'string' || !/^[0-9a-f]{16}$/.test(m.hash)) { this.stats.messagesRejected++; return; }
+      this._gotHash(m.tick, m.hash, 'remote', Number.isInteger(m.epoch) ? m.epoch : 0);
+    }
     if (m.type === 'resync' && this.resync && this.local === this.authority) this.resyncWanted = true;
     if (m.type === 'state') {
       this.stats.statesReceived++;
       this.stats.lastStateReceivedAt = this.tick;
-      if (this.stateHandler) this.stateHandler(m);   // a custom policy
-      else if (this.resync && (!this.pendingState || m.epoch > this.pendingState.epoch)) this.pendingState = m;
+      if (this.stateHandler) { this.stateHandler(m); return; }   // a custom policy decides
+      // Only the authority's states are adopted, only by the other peers, and only when newer than
+      // the state we hold: a peer cannot overwrite the authoritative world or move its epoch back.
+      const newer = Number.isInteger(m.epoch) && m.epoch > this.epoch && (!this.pendingState || m.epoch > this.pendingState.epoch);
+      if (!this.resync || this.local === this.authority || m.from !== this.authority || !newer || !Number.isInteger(m.tick) || m.tick < 0 || !m.state) {
+        this.stats.statesRejected++;
+        return;
+      }
+      this.pendingState = m;
     }
   }
 

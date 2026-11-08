@@ -7,9 +7,8 @@ import { Kernel } from './kernel.js';
 import { Profiler } from './profiler.js';
 import { arrayCtor, roundUp } from './types.js';
 
-export class SIError extends Error {
-  constructor(msg) { super(msg); this.name = 'ShaderIntelError'; }
-}
+import { SIError } from './errors.js';
+export { SIError };
 
 const WANT_FEATURES = [
   'subgroups', 'shader-f16', 'timestamp-query', 'float32-filterable', 'float32-blendable',
@@ -31,10 +30,12 @@ const WANT_LIMITS = [
  * @returns {Promise<Context>}
  */
 export async function init(opts = {}) {
-  if (typeof navigator === 'undefined' || !navigator.gpu)
-    throw new SIError('WebGPU is not available. Use Chrome/Edge 113+, Safari 26+ or Firefox 141+ (Windows), served from https:// or http://localhost.');
+  if (!isSupported())
+    throw new SIError('WebGPU is not available. Use Chrome/Edge 113+, Safari 26+ or Firefox 141+ (Windows), served from https:// or http://localhost.', 'unsupported');
+  // Share a device created elsewhere (three.js, another library): pass { device } (and its adapter if known).
+  if (opts.device) return new Context(opts.adapter || null, opts.device, opts);
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: opts.powerPreference || 'high-performance' });
-  if (!adapter) throw new SIError('No WebGPU adapter found (GPU blocklisted or disabled).');
+  if (!adapter) throw new SIError('No WebGPU adapter found (the GPU may be blocklisted or WebGPU disabled in this browser).', 'no-adapter');
   const disabled = new Set();
   if (opts.subgroups === false) disabled.add('subgroups');
   if (opts.f16 === false) disabled.add('shader-f16');
@@ -42,8 +43,18 @@ export async function init(opts = {}) {
   const requiredFeatures = WANT_FEATURES.filter((f) => adapter.features.has(f) && !disabled.has(f));
   const requiredLimits = {};
   for (const k of WANT_LIMITS) if (k in adapter.limits) requiredLimits[k] = adapter.limits[k];
-  const device = await adapter.requestDevice({ requiredFeatures, requiredLimits, label: 'ShaderIntel' });
+  let device;
+  try {
+    device = await adapter.requestDevice({ requiredFeatures, requiredLimits, label: 'ShaderIntel' });
+  } catch (e) {
+    throw new SIError(`Could not create a WebGPU device: ${e?.message || e}`, 'no-device');
+  }
   return new Context(adapter, device, opts);
+}
+
+/** True when this environment exposes WebGPU (navigator.gpu); a GPU adapter may still be unavailable. */
+export function isSupported() {
+  return typeof navigator !== 'undefined' && !!navigator.gpu;
 }
 
 export class Context {
@@ -51,7 +62,9 @@ export class Context {
     this.adapter = adapter;
     this.device = device;
     this.limits = device.limits;
-    const info = adapter.info || {};
+    this.destroyed = false;
+    this.ownsDevice = !opts.device;   // a shared device is left alive by destroy()
+    const info = adapter?.info || device.adapterInfo || {};
     const has = (f) => device.features.has(f);
     this.caps = {
       subgroups: has('subgroups'),
@@ -74,10 +87,16 @@ export class Context {
     this._inRegion = false;
     this._pipelines = new Map();
     this._samplers = new Map();
+    this._texDead = new WeakSet();
     this._ring = new UniformRing(this);
     this.profiler = new Profiler(this);
-    this.lost = device.lost.then((i) => { console.error(`ShaderIntel: device lost (${i.reason}): ${i.message}`); return i; });
-    device.addEventListener?.('uncapturederror', (e) => console.error('ShaderIntel WebGPU error:', e.error?.message || e));
+    this.lost = device.lost.then((i) => {
+      this.destroyed = true;
+      if (i.reason !== 'destroyed') console.error(`ShaderIntel: device lost (${i.reason}): ${i.message}`);
+      return i;
+    });
+    this._onUncaptured = (e) => console.error('ShaderIntel WebGPU error:', e.error?.message || e);
+    device.addEventListener?.('uncapturederror', this._onUncaptured);
   }
 
   // ------------------------------------------------------------- resources
@@ -113,7 +132,7 @@ export class Context {
       label: desc.label,
     });
     return { texture, view: texture.createView(), id: 't' + (++texId), width, height, depth, format: texture.format,
-      destroy() { texture.destroy(); } };
+      destroy: () => { if (this._texDead.has(texture)) return; this._texDead.add(texture); try { this.flush(); } catch { /* see GArray.destroy */ } texture.destroy(); } };
   }
 
   // ------------------------------------------------------------- recording
@@ -163,6 +182,7 @@ export class Context {
 
   /** Submit everything recorded so far. */
   flush() {
+    if (this.destroyed) { this._enc = null; this._pass = null; return; }
     this.endPass();
     const q = this.device.queue;
     this._ring.upload(q);
@@ -170,6 +190,7 @@ export class Context {
     const collect = this.profiler.resolve(this._enc);
     q.submit([this._enc.finish()]);
     this._enc = null;
+    if (this._staging) { for (const b of this._staging) b.destroy(); this._staging = null; }   // freed after the GPU is done with them
     this.stats.submits++;
     if (collect) collect();
   }
@@ -198,6 +219,27 @@ export class Context {
 
   fillFloat(arr, x) { f32tmp[0] = x; return this.fill(arr, u32tmp[0]); }
 
+  /**
+   * Write `data` into `dst` (a GArray or GPUBuffer) at `byteOffset`, ordered with the recorded work:
+   * unlike queue.writeBuffer (which lands before everything not yet submitted), dispatches recorded
+   * before this call see the old contents and those recorded after it see the new ones. For small,
+   * frequent uploads (colliders, sources, parameters) between dispatches of one batch.
+   */
+  writeOrdered(dst, data, byteOffset = 0) {
+    const src = ArrayBuffer.isView(data) ? data : new Float32Array(data);
+    const bytes = src.byteLength & ~3;
+    if (!bytes) return this;
+    const target = dst.buffer instanceof GPUBuffer ? dst.buffer : dst;
+    if (byteOffset + bytes > target.size) throw new SIError(`writeOrdered: ${bytes} bytes at ${byteOffset} do not fit in ${target.size}`, 'invalid-argument');
+    const staging = this.device.createBuffer({ size: bytes, usage: GPUBufferUsage.COPY_SRC, mappedAtCreation: true });
+    new Uint8Array(staging.getMappedRange()).set(new Uint8Array(src.buffer, src.byteOffset, bytes));
+    staging.unmap();
+    this.endPass();
+    this.encoder.copyBufferToBuffer(staging, 0, target, byteOffset, bytes);
+    (this._staging ||= []).push(staging);   // destroyed once the batch is submitted
+    return this;
+  }
+
   /** Copy `bytes` (default: all) between arrays/buffers. */
   copy(src, dst, bytes, srcOffset = 0, dstOffset = 0) {
     const s = src.buffer instanceof GPUBuffer ? src.buffer : src;
@@ -212,7 +254,9 @@ export class Context {
   async read(arr, count = arr.length) {
     const stride = arr.stride ?? 4;
     const total = arr.byteLength ?? arr.size;
-    const bytes = Math.min(total, roundUp(count * stride, 4));
+    const bytes = Math.min(total, roundUp(Math.max(0, count) * stride, 4));
+    const Ctor0 = arr.type ? arrayCtor(arr.type) : Uint32Array;
+    if (bytes === 0) return new Ctor0(0);
     const staging = this.device.createBuffer({ size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     this.endPass();
     this.encoder.copyBufferToBuffer(arr.buffer instanceof GPUBuffer ? arr.buffer : arr, 0, staging, 0, bytes);
@@ -262,7 +306,11 @@ export class Context {
   // ------------------------------------------------------------- shaders
   /** Create a shader module and a promise that rejects with readable errors. */
   shaderModule(code, label = 'shader') {
+    // Parse errors would also surface as an uncaptured validation error; catch that copy here,
+    // so a bad shader is reported once, formatted with its source lines (below).
+    this.device.pushErrorScope('validation');
     const module = this.device.createShaderModule({ code, label });
+    this.device.popErrorScope().catch(() => {});
     const ready = module.getCompilationInfo().then((info) => {
       const errors = info.messages.filter((m) => m.type === 'error');
       const warnings = info.messages.filter((m) => m.type === 'warning');
@@ -270,7 +318,7 @@ export class Context {
       if (errors.length) {
         const msg = formatMessages(label, code, errors);
         console.error(msg);
-        throw new SIError(msg);
+        throw new SIError(msg, 'compile');
       }
     });
     ready.catch(() => {});
@@ -295,8 +343,11 @@ export class Context {
       layout: d.createPipelineLayout({ bindGroupLayouts: [bgl] }),
       compute: { module, entryPoint: 'main' },
     });
-    const scope = d.popErrorScope().then((err) => {
-      if (err) { const m = `ShaderIntel: pipeline "${name}": ${err.message}`; console.error(m); throw new SIError(m); }
+    const scope = d.popErrorScope().then(async (err) => {
+      if (!err) return;
+      const m = `ShaderIntel: pipeline "${name}": ${err.message}`;
+      if (await ready.then(() => true, () => false)) console.error(m);   // else the WGSL errors were reported already
+      throw new SIError(m);
     });
     c = { pipeline, bgl, module, ready: Promise.all([ready, scope]).then(() => true) };
     c.ready.catch(() => {});
@@ -304,9 +355,17 @@ export class Context {
     return c;
   }
 
+  /**
+   * Submit pending work and release the device (and with it every buffer, texture and pipeline
+   * made on it). A device passed in with init({ device }) is not destroyed, only detached from.
+   */
   destroy() {
-    this.flush();
-    this.device.destroy();
+    if (this.destroyed) return;
+    try { this.flush(); } catch { /* the device may be lost already */ }
+    this.destroyed = true;
+    this.device.removeEventListener?.('uncapturederror', this._onUncaptured);
+    if (this.ownsDevice) this.device.destroy();
+    else { this._ring.destroy(); this.profiler.destroy(); this._gemmTmp?.destroy(); }
   }
 }
 
@@ -321,43 +380,66 @@ let texId = 0;
 const f32tmp = new Float32Array(1);
 const u32tmp = new Uint32Array(f32tmp.buffer);
 
-/** Per-batch ring of 256-byte uniform slots addressed with dynamic offsets. */
+/**
+ * Per-batch ring of 256-byte uniform slots addressed with dynamic offsets. When a batch needs
+ * more than one segment (1 MB), another segment is opened instead of flushing: a flush is
+ * impossible while a render pass is being recorded. Bind groups name their segment (gen).
+ */
 class UniformRing {
   constructor(ctx, size = 1 << 20) {
     this.ctx = ctx;
     this.size = size;
-    this.staging = new ArrayBuffer(size);
-    this.u32 = new Uint32Array(this.staging);
-    this.buffer = ctx.device.createBuffer({ size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: 'si-uniform-ring' });
-    this.used = 0;
-    this.batch = 0;
-    this.gen = 0;
     this.align = Math.max(256, ctx.limits.minUniformBufferOffsetAlignment);
+    this.segments = [];
+    this.seg = -1;
+    this.batch = 0;
+    this._open();
+  }
+
+  _open() {
+    this.seg++;
+    if (!this.segments[this.seg]) {
+      const staging = new ArrayBuffer(this.size);
+      this.segments.push({ staging, u32: new Uint32Array(staging), used: 0,
+        buffer: this.ctx.device.createBuffer({ size: this.size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: `si-uniform-ring-${this.seg}` }) });
+    }
+    const s = this.segments[this.seg];
+    s.used = 0;
+    this.buffer = s.buffer; this.u32 = s.u32; this.gen = this.seg; this.used = 0;
   }
 
   /** Copy the kernel's uniform bytes into a slot; identical consecutive data reuses its slot. */
   push(kernel) {
     const src = kernel.u32;
-    if (kernel._ringBatch === this.batch) {
+    if (kernel._ringBatch === this.batch && kernel._ringSeg === this.seg) {
       const base = kernel._ringOff >>> 2;
       let same = true;
       for (let k = 0; k < src.length; k++) if (this.u32[base + k] !== src[k]) { same = false; break; }
       if (same) return kernel._ringOff;
     }
-    if (this.used + kernel.U.size > this.size) this.ctx.flush();
+    if (this.used + kernel.U.size > this.size) { this.segments[this.seg].used = this.used; this._open(); }
     const off = this.used;
     this.u32.set(src, off >>> 2);
     this.used = roundUp(off + kernel.U.size, this.align);
     kernel._ringBatch = this.batch;
+    kernel._ringSeg = this.seg;
     kernel._ringOff = off;
     return off;
   }
 
   upload(queue) {
-    if (this.used) queue.writeBuffer(this.buffer, 0, this.staging, 0, this.used);
-    this.used = 0;
+    this.segments[this.seg].used = this.used;
+    for (let k = 0; k <= this.seg; k++) {
+      const s = this.segments[k];
+      if (s.used) queue.writeBuffer(s.buffer, 0, s.staging, 0, s.used);
+      s.used = 0;
+    }
+    this.seg = -1;
+    this._open();
     this.batch++;
   }
+
+  destroy() { for (const s of this.segments) s.buffer.destroy(); }
 }
 
 function formatMessages(label, code, messages) {

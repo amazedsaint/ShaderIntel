@@ -14,6 +14,8 @@
 //   scal texel (i,j,k) = (density, temperature) at the cell centre
 // Per step: advect faces and scalars (semi-Lagrangian) -> forces (vorticity
 // confinement, buoyancy, sources) -> divergence -> red–black SOR -> projection.
+import { destroyAll } from '../core/dispose.js';
+import { SIError } from '../core/errors.js';
 
 export class Smoke {
   constructor(ctx, o = {}) {
@@ -46,6 +48,13 @@ export class Smoke {
     this.pressure = tex('r32float', 'smoke-p');
     this.srcBuf = ctx.array('vec4f', 8 * 3, { label: 'smoke-sources' });
     this._kernels();
+  }
+
+  /** Free the simulation's 3D textures and buffers. */
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    destroyAll(this.velA, this.velB, this.scalA, this.scalB, this.curl, this.div, this.pressure, this.srcBuf);
   }
 
   _kernels() {
@@ -203,11 +212,12 @@ export class Smoke {
     this.sources.slice(0, 8).forEach((s, k) => {
       d.set([...s.center, s.radius ?? 0.1, s.density ?? 2, s.temperature ?? 1, 0, 0, ...(s.velocity || [0, 0, 0]), 0], k * 12);
     });
-    this.srcBuf.write(d);
+    this.srcBuf.writeOrdered(d);   // ordered: several step() calls in one batch each see their own sources
   }
 
   /** Clear all fields. */
   reset() {
+    this.ctx.flush();   // the texture writes below must not overtake recorded steps
     for (const t of [this.velA, this.velB, this.scalA, this.scalB, this.curl, this.div, this.pressure]) {
       const bytes = t.format === 'r32float' ? 4 : 8;
       const zero = new Uint8Array(t.width * t.height * bytes);
@@ -217,6 +227,8 @@ export class Smoke {
   }
 
   step(dt = 1 / 60) {
+    if (this.destroyed) throw new SIError('Smoke.step: it was destroyed');
+    if (!(dt > 0)) return;
     dt = Math.min(dt, 1 / 30);
     this.time += dt;
     this._uploadSources();

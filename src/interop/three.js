@@ -10,9 +10,14 @@
 //   scene.add(bodies.object);
 //   function frame() { world.step(1 / 60); bodies.update(); gpu.flush(); renderer.render(scene, camera); }
 //
+// gpu.flush() matters: ShaderIntel batches work until a flush, and three.js renders on its own
+// queue submissions, so without it three.js draws stale poses.
+//
 // This module never imports three.js: pass in the namespaces you use (no version lock-in).
 // It reaches the GPU buffer behind a three.js storage attribute through the WebGPU backend
 // (backend.get(attribute).buffer), which three.js has exposed since r160.
+
+import { SIError } from '../core/errors.js';
 
 /** A WebGPURenderer that uses ShaderIntel's device (features and limits already negotiated). */
 export async function renderer(THREE, gpu, opts = {}) {
@@ -24,10 +29,10 @@ export async function renderer(THREE, gpu, opts = {}) {
 /** The GPUBuffer three.js allocated for a storage attribute (created on demand). */
 export function bufferOf(renderer, attribute) {
   const backend = renderer.backend;
-  if (!backend?.get || !backend.createStorageAttribute) throw new Error('ShaderIntel three interop: needs THREE.WebGPURenderer (WebGPU backend)');
+  if (!backend?.get || !backend.createStorageAttribute) throw new SIError('three interop: needs THREE.WebGPURenderer with the WebGPU backend', 'invalid-argument');
   let data = backend.get(attribute);
   if (!data.buffer) { backend.createStorageAttribute(attribute); data = backend.get(attribute); }
-  if (!data.buffer) throw new Error('ShaderIntel three interop: could not reach the storage buffer of an attribute');
+  if (!data.buffer) throw new SIError('three interop: could not reach the storage buffer of an attribute (three.js version not supported?)');
   return data.buffer;
 }
 
@@ -72,8 +77,12 @@ export function bodies(o) {
     sphere: new THREE.SphereGeometry(1, 24, 16),
     capsule: new THREE.CapsuleGeometry(1, 2, 8, 16),
   };
+  const seen = new Set();
   for (const [name, shape] of Object.entries(SHAPES)) {
-    const material = o.material?.(name) || new THREE.MeshStandardNodeMaterial({ roughness: 0.55, metalness: 0.0 });
+    // each shape needs its own positionNode: clone a material the callback hands out more than once
+    let material = o.material?.(name) || new THREE.MeshStandardNodeMaterial({ roughness: 0.55, metalness: 0.0 });
+    if (seen.has(material)) material = material.clone();
+    seen.add(material);
     const base = instanceIndex.mul(3);
     const pv = data.element(base);
     const q = data.element(base.add(1));
@@ -101,11 +110,17 @@ export function bodies(o) {
     object: group,
     meshes,
     attribute: attr,
-    /** Copy this frame's poses into three.js (GPU → GPU). Call after world.step(), before rendering. */
+    /** Copy this frame's poses into three.js (GPU → GPU). Call after world.step(), then gpu.flush(), before rendering. */
     update() {
       const n = world.count;
       for (const m of Object.values(meshes)) m.count = n;
       if (n) pack.run(n, { groups: (o.groups ?? 0xffffffff) >>> 0 }, { B: world.B, out: buf });
+    },
+    /** Remove the meshes from their parent and free their geometries and (default) materials. */
+    dispose() {
+      group.removeFromParent?.();
+      for (const g of Object.values(geometries)) g.dispose();
+      if (!o.material) for (const m of Object.values(meshes)) m.material.dispose();
     },
   };
 }
@@ -119,7 +134,8 @@ export function particles(o) {
   const { THREE, TSL, renderer: r } = o;
   const src0 = typeof o.source === 'function' ? o.source() : o.source;
   const gpu = o.gpu || src0.ctx;
-  const max = o.max;
+  const max = o.max ?? Math.floor(src0.length / (o.stride ?? 1));
+  const countOf = () => (o.count === undefined ? max : typeof o.count === 'function' ? o.count() : o.count);
   const attr = new THREE.StorageInstancedBufferAttribute(max, 4);
   const buf = bufferOf(r, attr);
   const pack = gpu.kernel({
@@ -139,9 +155,15 @@ export function particles(o) {
     object: mesh,
     attribute: attr,
     update() {
-      const n = Math.min(max, typeof o.count === 'function' ? o.count() : o.count);
+      const n = Math.max(0, Math.min(max, countOf() | 0));
       mesh.count = n;
       if (n) pack.run(n, { stride: o.stride ?? 1, scale: o.scale ?? 1, offset: o.offset ?? [0, 0, 0] }, { src: typeof o.source === 'function' ? o.source() : o.source, out: buf });
+    },
+    /** Remove the mesh from its parent and free its geometry and (default) material. */
+    dispose() {
+      mesh.removeFromParent?.();
+      mesh.geometry.dispose();
+      if (!o.material) material.dispose();
     },
   };
 }

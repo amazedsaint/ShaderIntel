@@ -31,7 +31,7 @@ export const GEMM_CONFIGS = [
   { BM: 128, BN: 128, BK: 8, TM: 8, TN: 8 },
 ];
 
-const cache = new Map();
+const cache = new WeakMap();   // per Context: a destroyed context's kernels go with it
 const R = (n) => Array.from({ length: n }, (_, k) => k);
 
 /** The kernel for one (config, transA, transB, activation, bias, beta) combination. */
@@ -176,25 +176,32 @@ function reduceKernel(ctx, act, bias, accumulate) {
 
 /** Time every configuration on this device for an n×n×n multiply; remember the fastest (per adapter). */
 export async function autotuneGemm(ctx, { n = 2048, reps = 5, cache: useCache = true } = {}) {
-  const id = `si-gemm-${ctx.caps.vendor}-${ctx.caps.architecture}`;
+  // versioned: a cached tile shape is only reused if it is still one of the configurations on offer
+  const id = `si-gemm-v2-${ctx.caps.vendor}-${ctx.caps.architecture}`;
+  const known = (c) => GEMM_CONFIGS.find((g) => c && ['BM', 'BN', 'BK', 'TM', 'TN'].every((k) => g[k] === c[k]) && !!g.prefetch === !!c.prefetch);
   if (useCache && typeof localStorage !== 'undefined') {
-    const hit = localStorage.getItem(id);
-    if (hit) { ctx._gemmCfg = JSON.parse(hit); return { best: ctx._gemmCfg, cached: true }; }
+    try {
+      const hit = known(JSON.parse(localStorage.getItem(id)));
+      if (hit) { ctx._gemmCfg = hit; return { best: hit, cached: true }; }
+    } catch { /* a corrupt cache entry is re-measured */ }
   }
   const A = ctx.array('f32', n * n), B = ctx.array('f32', n * n), C = ctx.array('f32', n * n);
   const results = [];
-  for (const cfg of GEMM_CONFIGS) {
-    const run = () => gemm(ctx, A, B, C, { M: n, N: n, K: n, cfg });
-    run(); await ctx.idle();
-    const t0 = performance.now();
-    for (let r = 0; r < reps; r++) run();
-    await ctx.idle();
-    const ms = (performance.now() - t0) / reps;
-    results.push({ cfg, ms, tflops: (2 * n ** 3) / (ms * 1e9) });
+  try {
+    for (const cfg of GEMM_CONFIGS) {
+      const run = () => gemm(ctx, A, B, C, { M: n, N: n, K: n, cfg });
+      run(); await ctx.idle();
+      const t0 = performance.now();
+      for (let r = 0; r < reps; r++) run();
+      await ctx.idle();
+      const ms = (performance.now() - t0) / reps;
+      results.push({ cfg, ms, tflops: (2 * n ** 3) / (ms * 1e9) });
+    }
+  } finally {
+    A.destroy(); B.destroy(); C.destroy();
   }
   results.sort((a, b) => a.ms - b.ms);
   ctx._gemmCfg = results[0].cfg;
   if (useCache && typeof localStorage !== 'undefined') localStorage.setItem(id, JSON.stringify(results[0].cfg));
-  A.destroy(); B.destroy(); C.destroy();
   return { best: results[0].cfg, results };
 }

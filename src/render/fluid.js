@@ -10,6 +10,8 @@
 //                     sky reflection, refraction of the opaque scene with Beer–Lambert
 //                     absorption over the thickness, sun specular; writes depth.
 import { RenderProgram } from './program.js';
+import { destroyAll } from '../core/dispose.js';
+import { SIError } from '../core/errors.js';
 
 export class FluidSurface {
   /**
@@ -129,9 +131,12 @@ export class FluidSurface {
           let dxn = pc - viewPos(max(px - vec2i(1, 0), vec2i(0)));
           let dyp = viewPos(min(px + vec2i(0, 1), sz)) - pc;
           let dyn = pc - viewPos(max(px - vec2i(0, 1), vec2i(0)));
-          let ddx = select(dxp, dxn, abs(dxn.z) < abs(dxp.z));
-          let ddy = select(dyp, dyn, abs(dyn.z) < abs(dyp.z));
-          var nv = normalize(cross(ddy, ddx));
+          // one-sided differences at the screen border (the clamped neighbour is the pixel itself)
+          let ddx = select(dxp, dxn, (abs(dxn.z) < abs(dxp.z) && px.x > 0) || px.x >= sz.x);
+          let ddy = select(dyp, dyn, (abs(dyn.z) < abs(dyp.z) && px.y > 0) || px.y >= sz.y);
+          let cr = cross(ddy, ddx);
+          let cl = length(cr);
+          var nv = select(vec3f(0.0, 0.0, 1.0), cr / max(cl, 1e-30), cl > 1e-20);
           if (nv.z < 0.0) { nv = -nv; }
           let n = normalize((cam.invView * vec4f(nv, 0.0)).xyz);
           let wp = (cam.invView * vec4f(pc, 1.0)).xyz;
@@ -156,7 +161,16 @@ export class FluidSurface {
     this.w = 0; this.h = 0;
   }
 
-  set(v) { Object.assign(this.values, v); return this; }
+  /** Update the look (radius, absorb, tint, refraction, filterRadius, ...) or the filter iterations; unknown names throw. */
+  set(v) {
+    const o = { ...v };
+    if ('iterations' in o) { this.iterations = Math.max(0, o.iterations | 0); delete o.iterations; }
+    if (o.sun) o.sun = norm(o.sun);
+    for (const k of Object.keys(o))
+      if (!(k in this.values)) throw new SIError(`FluidSurface.set: unknown value "${k}" (use ${Object.keys(this.values).join(', ')}, iterations)`, 'invalid-argument');
+    Object.assign(this.values, o);
+    return this;
+  }
 
   _alloc(w, h) {
     for (const t of [this.zA, this.zB, this.zDepth, this.thick, this.sceneCopy]) t?.destroy();
@@ -173,6 +187,7 @@ export class FluidSurface {
   get count() { const c = this.o.count; return typeof c === 'function' ? c() : c ?? this.data.length; }
 
   afterScene(view) {
+    if (this.destroyed || this.data?.destroyed) return;
     const n = this.count;
     if (!n) return;
     if (view.width !== this.w || view.height !== this.h) this._alloc(view.width, view.height);
@@ -209,6 +224,7 @@ export class FluidSurface {
       { zTex: this.zA, thick: this.thick, scene: this.sceneCopy });
     pass.end();
   }
+  destroy() { this.destroyed = true; destroyAll(this.zA, this.zB, this.zDepth, this.thick, this.sceneCopy); this.zA = null; this.w = this.h = 0; }
 }
 
 function norm(v) { const l = Math.hypot(...v) || 1; return v.map((x) => x / l); }

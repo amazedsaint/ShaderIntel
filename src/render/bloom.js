@@ -2,11 +2,12 @@
 // Jimenez, "Next Generation Post Processing in Call of Duty: AW", 2014).
 // No threshold: every pixel contributes a little, so bright HDR values glow
 // naturally and the image stays physically plausible.
+import { destroyAll } from '../core/dispose.js';
 export class Bloom {
   constructor(ctx, o = {}) {
     this.ctx = ctx;
     this.strength = o.strength ?? 0.05;
-    this.levels = o.levels ?? 6;
+    this.levels = Math.max(1, Math.round(o.levels ?? 6));
     this.radius = o.radius ?? 1;
     this.down = [];
     this.up = [];
@@ -33,7 +34,12 @@ export class Bloom {
         let l = textureSampleLevel(src, lin, uv + t * vec2f(-1.0, -1.0), 0.0).rgb;
         let m = textureSampleLevel(src, lin, uv + t * vec2f(1.0, -1.0), 0.0).rgb;
         var o = e * 0.125 + (a + c + g + ii) * 0.03125 + (b + d + f + h) * 0.0625 + (j + k + l + m) * 0.125;
-        if (u.firstLevel == 1u) { o = min(o, vec3f(64.0)); } // tame fireflies before they spread
+        if (u.firstLevel == 1u) {
+          // a NaN or infinity in the scene would spread over the whole chain: drop it (integer test,
+          // which no compiler may fold away), then tame fireflies before they spread
+          let bits = bitcast<vec3u>(o) & vec3u(0x7fffffffu);
+          o = min(select(o, vec3f(0.0), bits >= vec3u(0x7f800000u)), vec3f(64.0));
+        }
         textureStore(dst, vec2i(p.xy), vec4f(max(o, vec3f(0.0)), 1.0));`,
     });
     this.upK = ctx.kernel({
@@ -88,4 +94,5 @@ export class Bloom {
     }
     return n > 1 ? this.up[0] : this.down[0];
   }
+  destroy() { this.destroyed = true; destroyAll(this.down, this.up); this.down = []; this.up = []; }
 }

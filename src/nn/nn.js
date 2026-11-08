@@ -11,9 +11,12 @@
 // Both products use the transposed GEMM variants, so no transpose is ever materialised.
 import { gemm, ACTIVATIONS } from './gemm.js';
 import { defineModule } from '../core/wgsl.js';
+import { SIError } from '../core/errors.js';
+import { destroyAll } from '../core/dispose.js';
 import '../shaders/hash.js';
 
-// activation derivative written in terms of the output y (when possible) or the input z
+// activation derivative written in terms of the output y where possible; the others (sin, gelu)
+// keep their pre-activation z and use ACTIVATIONS[act].df of x = z
 const DERIV_FROM_Y = { none: '1.0', relu: 'select(0.0, 1.0, y > 0.0)', leaky: 'select(0.01, 1.0, y > 0.0)', tanh: '1.0 - y * y', sigmoid: 'y * (1.0 - y)' };
 
 defineModule('nn', {
@@ -35,7 +38,7 @@ export class Dense {
     this.ctx = ctx;
     this.in = inF; this.out = outF;
     this.act = o.act || 'relu';
-    if (!ACTIVATIONS[this.act]) throw new Error(`Dense: unknown activation ${this.act}`);
+    if (!ACTIVATIONS[this.act]) throw new SIError(`Dense: unknown activation "${this.act}" (use ${Object.keys(ACTIVATIONS).join(', ')})`, 'invalid-argument');
     this.W = ctx.array('f32', inF * outF, { label: 'nn-W' });
     this.b = ctx.array('f32', outF, { label: 'nn-b' });
     this.gW = ctx.array('f32', inF * outF, { label: 'nn-gW' });
@@ -44,19 +47,26 @@ export class Dense {
   }
   get params() { return [{ w: this.W, g: this.gW }, { w: this.b, g: this.gb }]; }
 
-  /** He / Xavier / SIREN initialisation (uniform), biases zero. */
+  /**
+   * He / Xavier / SIREN initialisation (uniform), biases zero. SIREN (Sitzmann et al. 2020) uses
+   * sin(ω₀ (W x + b)); the forward pass here is sin(W x + b), so ω₀ is folded into the weights:
+   * first layer U(±ω₀ / in), hidden layers U(±√(6 / in)).
+   */
   init(kind, seed, first = false, omega = 30) {
     const n = this.in * this.out;
     let bound;
     if (kind === 'he') bound = Math.sqrt(6 / this.in);
-    else if (kind === 'siren') bound = first ? 1 / this.in : Math.sqrt(6 / this.in) / omega;
+    else if (kind === 'siren') bound = first ? omega / this.in : Math.sqrt(6 / this.in);
     else bound = Math.sqrt(6 / (this.in + this.out));
     const w = new Float32Array(n);
     let s = (seed * 2654435761) >>> 0 || 1;
     for (let k = 0; k < n; k++) { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; w[k] = ((s >>> 0) / 4294967296 * 2 - 1) * bound; }
+    this.ctx.flush();   // must not overtake recorded work that reads the old weights
     this.W.write(w);
     this.b.write(new Float32Array(this.out));
   }
+
+  destroy() { destroyAll(this.W, this.b, this.gW, this.gb); }
 }
 
 /**
@@ -80,6 +90,7 @@ export class FourierFeatures {
   }
   get params() { return []; }
   forward(X, Y, batch) { this.k.run(batch * this.in, { inF: this.in, bands: this.bands }, { X, Y }); return Y; }
+  destroy() { /* a kernel only */ }
 }
 
 /**
@@ -98,10 +109,13 @@ export class MLP {
     this.layers = [];
     for (let k = 0; k + 1 < sizes.length; k++) {
       const last = k + 2 === sizes.length;
-      this.layers.push(new Dense(ctx, sizes[k], sizes[k + 1], { act: last ? o.out || 'none' : o.act || 'relu', first: k === 0, seed: o.seed ? o.seed + k : undefined }));
+      this.layers.push(new Dense(ctx, sizes[k], sizes[k + 1], { act: last ? o.out || 'none' : o.act || 'relu', first: k === 0, seed: o.seed !== undefined ? o.seed + k : undefined }));
     }
     const A = (n, label) => ctx.array('f32', n, { label });
     this.acts = [A(this.maxBatch * sizes[0], 'nn-a0'), ...this.layers.map((l, k) => A(this.maxBatch * l.out, `nn-a${k + 1}`))];
+    // layers whose derivative needs the pre-activation z (sin, gelu) keep it here
+    this.pre = this.layers.map((l, k) => (DERIV_FROM_Y[l.act] ? null : A(this.maxBatch * l.out, `nn-z${k + 1}`)));
+    this._actK = new Map();
     this.grads = this.acts.map((a, k) => (k === 0 ? null : A(a.length, `nn-d${k}`)));
     this.dZ = A(this.maxBatch * Math.max(...this.layers.map((l) => l.out)), 'nn-dz');
     this.input = this.encoder ? A(this.maxBatch * o.layers[0], 'nn-x') : this.acts[0];
@@ -128,23 +142,33 @@ export class MLP {
 
   /** Y = net(X) for `batch` rows (X: [batch × in], or this.input when omitted). */
   forward(X = this.input, batch = this.maxBatch) {
-    if (batch > this.maxBatch) throw new Error(`MLP.forward: batch ${batch} > maxBatch ${this.maxBatch}`);
+    if (batch > this.maxBatch) throw new SIError(`MLP.forward: batch ${batch} > maxBatch ${this.maxBatch}`, 'invalid-argument');
     let a = this.acts[0];
     if (this.encoder) this.encoder.forward(X, a, batch);
     else if (X !== a) this.ctx.copy(X, a, batch * this.layers[0].in * 4);
     this.layers.forEach((l, k) => {
-      gemm(this.ctx, this.acts[k], l.W, this.acts[k + 1], { M: batch, N: l.out, K: l.in, bias: l.b, act: l.act });
+      if (!this.pre[k]) { gemm(this.ctx, this.acts[k], l.W, this.acts[k + 1], { M: batch, N: l.out, K: l.in, bias: l.b, act: l.act }); return; }
+      // keep z = X W + b for the backward pass, then y = act(z)
+      gemm(this.ctx, this.acts[k], l.W, this.pre[k], { M: batch, N: l.out, K: l.in, bias: l.b, act: 'none' });
+      this._act(l.act).run(batch * l.out, null, { Z: this.pre[k], Y: this.acts[k + 1] });
     });
     return this.output;
+  }
+
+  _act(act) {
+    if (!this._actK.has(act)) {
+      this._actK.set(act, this.ctx.kernel({ name: `nn-act-${act}`, buffers: { Z: { type: 'f32', access: 'read' }, Y: { type: 'f32' } },
+        code: `let x = Z[i]; Y[i] = ${ACTIVATIONS[act].f};` }));
+    }
+    return this._actK.get(act);
   }
 
   _deriv(act) {
     if (!this._derivK.has(act)) {
       const fromY = DERIV_FROM_Y[act];
-      if (!fromY) throw new Error(`MLP.backward: activation ${act} needs its pre-activation; use relu, leaky, tanh, sigmoid or none`);
       this._derivK.set(act, this.ctx.kernel({
         name: `nn-deriv-${act}`, buffers: { dY: { type: 'f32', access: 'read' }, Y: { type: 'f32', access: 'read' }, dZ: { type: 'f32' } },
-        code: `let y = Y[i]; dZ[i] = dY[i] * (${fromY});`,
+        code: fromY ? `let y = Y[i]; dZ[i] = dY[i] * (${fromY});` : `let x = Y[i]; dZ[i] = dY[i] * (${ACTIVATIONS[act].df});`,   // Y holds z here
       }));
     }
     return this._derivK.get(act);
@@ -152,10 +176,11 @@ export class MLP {
 
   /** Backpropagate dY = ∂L/∂output ([batch × out]); fills every layer's gW, gb. */
   backward(dY, batch) {
+    if (batch > this.maxBatch) throw new SIError(`MLP.backward: batch ${batch} > maxBatch ${this.maxBatch}`, 'invalid-argument');
     let d = dY;
     for (let k = this.layers.length - 1; k >= 0; k--) {
       const l = this.layers[k];
-      this._deriv(l.act).run(batch * l.out, null, { dY: d, Y: this.acts[k + 1], dZ: this.dZ });
+      this._deriv(l.act).run(batch * l.out, null, { dY: d, Y: this.pre[k] || this.acts[k + 1], dZ: this.dZ });
       gemm(this.ctx, this.acts[k], this.dZ, l.gW, { M: l.in, N: l.out, K: batch, transA: true });          // dW = Xᵀ dZ
       this.colSumK.dispatch(l.out, { rows: batch, cols: l.out }, { D: this.dZ, g: l.gb });                    // db = Σ dZ
       if (k > 0) {
@@ -163,6 +188,11 @@ export class MLP {
         d = this.grads[k];
       }
     }
+  }
+
+  /** Free every buffer of the network (its layers, activations and gradients). */
+  destroy() {
+    destroyAll(this.layers, this.acts, this.grads, this.pre, this.dZ, this.encoder ? this.input : null);
   }
 }
 
@@ -188,12 +218,14 @@ export class MSELoss {
   }
   /** Returns this.grad; call readLoss() for the value. */
   run(Y, T, count) {
+    if (count > this.grad.length) throw new SIError(`MSELoss.run: ${count} elements > maxElems ${this.grad.length}`, 'invalid-argument');
     this.groups = Math.min(1024, Math.ceil(count / 256));
     this.ctx.clear(this.sum);
     this.k.dispatch(this.groups, { count, scale: 1 / count }, { Y, T, dY: this.grad, part: this.sum });
     return this.grad;
   }
   async readLoss() { const p = await this.sum.read(this.groups); return p.reduce((a, b) => a + b, 0); }
+  destroy() { destroyAll(this.grad, this.sum); }
 }
 
 /** Adam (Kingma & Ba 2015) with bias correction; optional weight decay (AdamW) and gradient clipping. */
@@ -223,6 +255,8 @@ export class Adam {
     this.params.forEach((p, k) => this.k.run(p.w.length, { lr: this.lr, b1: this.beta1, b2: this.beta2, eps: this.eps, c1, c2, wd: this.weightDecay, clip: this.clip },
       { w: p.w, g: p.g, m: this.state[k].m, v: this.state[k].v }));
   }
+  /** Free the moment buffers (the parameters belong to the network). */
+  destroy() { destroyAll(this.state.map((s) => [s.m, s.v])); this.state = []; }
 }
 
 /** Plain SGD with momentum. */
@@ -236,6 +270,7 @@ export class SGD {
     });
   }
   step() { this.params.forEach((p, k) => this.k.run(p.w.length, { lr: this.lr, mu: this.momentum }, { w: p.w, g: p.g, v: this.vel[k] })); }
+  destroy() { destroyAll(this.vel); this.vel = []; }
 }
 
 /**
@@ -252,7 +287,10 @@ export class Population {
   constructor(ctx, o) {
     this.ctx = ctx;
     this.sizes = o.layers;
-    this.count = o.count + (o.count & 1);
+    // agents come in antithetic pairs (θ + σε, θ − σε)
+    if (!(Number.isInteger(o.count) && o.count >= 2 && o.count % 2 === 0))
+      throw new SIError(`Population: count must be an even number ≥ 2 (agents come in antithetic pairs); got ${o.count}`, 'invalid-argument');
+    this.count = o.count;
     this.sigma = o.sigma ?? 0.05;
     this.lr = o.lr ?? 0.03;
     this.act = o.act || 'tanh';
@@ -266,7 +304,7 @@ export class Population {
     this.theta = ctx.array('f32', n, { label: 'pop-theta' });
     this.weights = ctx.array('f32', this.count, { label: 'pop-rank-weights' });
     const init = new Float32Array(n);
-    let s = this.seed;
+    let s = (this.seed >>> 0) % 2147483647 || 1;   // the Lehmer generator below is stuck at 0 otherwise
     for (let k = 0; k + 1 < this.sizes.length; k++) {
       const a = this.sizes[k], b = this.sizes[k + 1], bound = Math.sqrt(6 / (a + b));
       for (let q = 0; q < a * b; q++) { s = (s * 16807) % 2147483647; init[this.offsets[k] + q] = (s / 2147483647 * 2 - 1) * bound; }
@@ -322,6 +360,7 @@ export class Population {
   /** One ES step from per-agent fitness (GArray or Float32Array, higher is better). Returns { mean, best }. */
   async update(fitness) {
     const f = fitness instanceof Float32Array ? fitness : await fitness.read(this.count);
+    if (f.length < this.count) throw new SIError(`Population.update: ${f.length} fitness values for ${this.count} agents`, 'invalid-argument');
     const P = this.count;
     const order = Array.from({ length: P }, (_, k) => k).sort((a, b) => f[a] - f[b]);
     const w = new Float32Array(P);
@@ -334,4 +373,6 @@ export class Population {
     for (let k = 0; k < P; k++) { mean += f[k]; best = Math.max(best, f[k]); }
     return { mean: mean / P, best };
   }
+
+  destroy() { destroyAll(this.theta, this.weights); }
 }

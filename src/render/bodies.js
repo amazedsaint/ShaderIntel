@@ -114,9 +114,19 @@ export class Bodies {
     this.program.set({ sun: sun.map((x) => x / l), staticColor: o.staticColor || [0.25, 0.26, 0.28], saturation: o.saturation ?? 1,
       kinematicColor: o.kinematicColor || [0.55, 0.42, 0.22], groupMask: (o.groups ?? 0xffffffff) >>> 0 });
   }
-  set(v) { this.program.set(v); return this; }
+  /** Update sun, staticColor, kinematicColor, saturation or groups (the visible collision groups). */
+  set(v) {
+    const o = { ...v };
+    if ('groups' in o) { o.groupMask = (o.groups ?? 0xffffffff) >>> 0; delete o.groups; }
+    if (o.sun) { const l = Math.hypot(...o.sun) || 1; o.sun = o.sun.map((x) => x / l); }
+    this.program.set(o);
+    return this;
+  }
   draw(pass, view) {
+    if (this.world.destroyed) return;
     const n = this.world.count;
     if (n) this.program.draw(pass, view, 36, n, null, { P: this.world.B });
   }
+  /** Layers own no GPU memory beyond their pipeline (garbage-collected); kept for a uniform API. */
+  destroy() { this.destroyed = true; }
 }

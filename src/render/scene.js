@@ -1,12 +1,15 @@
 // Scene helpers: a sky + ground "stage" and simple line geometry (box outlines).
 import { Fullscreen } from './fullscreen.js';
 import { RenderProgram } from './program.js';
+import { destroyAll } from '../core/dispose.js';
 
 /** Analytic sky gradient plus an infinite anti-aliased grid floor at y = height. Writes depth. */
 export class Stage {
   constructor(ctx, o = {}) {
     this.layer = new Fullscreen(ctx, {
-      name: 'stage', writeDepth: true, imports: ['color', 'pbr'],
+      // less-equal: the sky (depth 1.0) only fills what nothing drew, the floor depth-tests — so the
+      // stage can be added before or after other layers
+      name: 'stage', writeDepth: true, depthCompare: 'less-equal', imports: ['color', 'pbr'],
       uniforms: { height: 'f32', cell: 'f32', groundColor: 'vec3f', lineColor: 'vec3f', skyTop: 'vec3f', skyBottom: 'vec3f', fog: 'f32', sun: 'vec3f' },
       values: {
         height: o.height ?? 0, cell: o.cell ?? 0.1,
@@ -40,15 +43,16 @@ export class Stage {
   }
   set(v) { this.layer.set(v); return this; }
   draw(pass, view) { this.layer.draw(pass, view); }
+  destroy() { this.layer.destroy(); }
 }
 
 /** Colored line segments (line-list) from a Float32Array of xyz pairs. */
 export class Lines {
   constructor(ctx, o) {
     this.ctx = ctx;
-    const pts = o.points;
-    this.count = pts.length / 3;
-    this.data = ctx.array('vec4f', this.count);
+    const pts = o.points || [];
+    this.count = Math.floor(pts.length / 3);
+    this.data = ctx.array('vec4f', Math.max(1, this.count));   // an empty set still gets a (unused) buffer
     const v4 = new Float32Array(this.count * 4);
     for (let k = 0; k < this.count; k++) { v4[4 * k] = pts[3 * k]; v4[4 * k + 1] = pts[3 * k + 1]; v4[4 * k + 2] = pts[3 * k + 2]; v4[4 * k + 3] = 1; }
     this.data.write(v4);
@@ -63,7 +67,9 @@ export class Lines {
     });
     this.program.bind({ L: this.data });
   }
-  draw(pass, view) { this.program.draw(pass, view, this.count); }
+  set(v) { this.program.set(v); return this; }
+  draw(pass, view) { if (this.count) this.program.draw(pass, view, this.count); }
+  destroy() { destroyAll(this.data); }
 
   /** Wireframe box from min/max corners. */
   static box(ctx, min, max, color) {

@@ -68,4 +68,12 @@ export class Profiler {
   }
 
   reset() { this.results.clear(); }
+
+  destroy() {
+    if (!this.enabled) return;
+    this.enabled = false;
+    this.querySet.destroy();
+    this.resolveBuf.destroy();
+    for (const b of this.pool.splice(0)) b.destroy();
+  }
 }

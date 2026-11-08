@@ -4,6 +4,8 @@
 // neighbour loop reads contiguous memory (the arrays stay permuted — boids have
 // no identity, so no index map is needed).
 import { SpatialGrid } from '../prims/grid.js';
+import { destroyAll } from '../core/dispose.js';
+import { SIError } from '../core/errors.js';
 
 export class Boids {
   /**
@@ -71,6 +73,12 @@ export class Boids {
     });
   }
 
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    destroyAll(this.pos, this.vel, this.sPos, this.sVel, this.grid);
+  }
+
   /** Scatter boids uniformly in the cube with random velocities. */
   randomize(seed = 1) {
     let s = seed >>> 0 || 1;
@@ -81,11 +89,20 @@ export class Boids {
       const z = rnd() * 2 - 1, a = rnd() * 6.283, r = Math.sqrt(1 - z * z), sp = this.params.minSpeed;
       v.set([r * Math.cos(a) * sp, r * Math.sin(a) * sp, z * sp, 0], 4 * k);
     }
+    this.ctx.flush();   // must not overtake steps that are recorded but not yet submitted
     this.pos.write(p); this.vel.write(v);
     return this;
   }
 
   step(dt = 1 / 60) {
+    if (this.destroyed) throw new SIError('Boids.step: it was destroyed');
+    if (!(dt > 0)) return;
+    // the neighbour grid's cells are sized for the perception radius: rebuild it when that changes
+    if (Math.abs(this.grid.cellSize - this.params.radius) > 1e-9) {
+      const h = this.half;
+      this.grid.destroy();
+      this.grid = new SpatialGrid(this.ctx, { maxCount: this.count, min: [-h, -h, -h], max: [h, h, h], cellSize: this.params.radius });
+    }
     const P = this.params, g = this.grid;
     this.ctx.region('boids', () => {
       g.build(this.pos, this.count);

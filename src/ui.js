@@ -20,6 +20,7 @@ const CSS = `
 .si-panel button:hover { background: #2b3d51; }
 .si-panel select { width: 100%; background: #1b232d; color: #e6edf3; border: 1px solid #344558; border-radius: 4px; padding: 3px; font: inherit; }
 .si-panel .note { color: #8b9bb0; margin-top: 8px; font-size: 11px; }
+.si-panel a { color: #6cb6ff; }
 `;
 
 let styled = false;
@@ -67,7 +68,9 @@ export function panel(title, controls = [], parent = document.body) {
       r.type = 'range'; r.min = c.min ?? 0; r.max = c.max ?? 1; r.step = c.step ?? 0.01; r.value = c.value ?? 0;
       const val = document.createElement('span');
       val.className = 'val';
-      const dec = Math.max(0, Math.min(6, -Math.floor(Math.log10(+(c.step ?? 0.01)) + 1e-9)));
+      // as many decimals as the step has (0.25 → 2, 2.5 → 1, 5 → 0)
+      const stepStr = String(c.step ?? 0.01);
+      const dec = /e-(\d+)$/.test(stepStr) ? Math.min(6, +RegExp.$1) : Math.min(6, (stepStr.split('.')[1] || '').length);
       const fmt = (v) => (+v).toFixed(dec);
       val.textContent = fmt(r.value);
       api.values[c.label] = +r.value;

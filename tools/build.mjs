@@ -7,14 +7,16 @@
 // the same name in different files never collide) and returns its export object.
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, resolve, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const root = resolve(new URL('..', import.meta.url).pathname);
+const root = resolve(fileURLToPath(new URL('..', import.meta.url)));   // (URL.pathname would keep %20 for spaces)
 const entry = resolve(root, 'src/index.js');
 const modules = new Map();
 const order = [];
 
-const IMPORT_FROM = /^import\s+(\{[^}]*\}|\*\s+as\s+[\w$]+|[\w$]+)\s+from\s+['"]([^'"]+)['"];?[ \t]*$/gm;
-const IMPORT_BARE = /^import\s+['"]([^'"]+)['"];?[ \t]*$/gm;
+const TRAIL = String.raw`;?[ \t]*(?:\/\/[^\n]*)?$`;   // optional semicolon and trailing comment
+const IMPORT_FROM = new RegExp(String.raw`^import\s+(\{[^}]*\}|\*\s+as\s+[\w$]+|[\w$]+)\s+from\s+['"]([^'"]+)['"]` + TRAIL, 'gm');
+const IMPORT_BARE = new RegExp(String.raw`^import\s+['"]([^'"]+)['"]` + TRAIL, 'gm');
 const EXPORT_FROM = /^export\s+\{([^}]*)\}\s+from\s+['"]([^'"]+)['"];?[ \t]*$/gm;
 const EXPORT_LIST = /^export\s+\{([^}]*)\};?[ \t]*$/gm;
 const EXPORT_DECL = /^export\s+(async\s+function|function|class|const|let|var)\s+([A-Za-z_$][\w$]*)/gm;
@@ -62,7 +64,12 @@ function load(path) {
     for (const { local, exported } of specList(list)) mod.exports.push(exported === local ? local : `${exported}: ${local}`);
     return '';
   });
+  // forms this bundler does not understand must fail the build, not ship a broken bundle
+  const multi = /^export\s+(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=[^;\n]*,\s*[A-Za-z_$][\w$]*\s*=/m.exec(src);
+  if (multi) throw new Error(`${relative(root, path)}: one export per declaration, please ("${multi[0].slice(0, 60)}…")`);
   src = src.replace(EXPORT_DECL, (_, kind, name) => { mod.exports.push(name); return `${kind} ${name}`; });
+  const left = /^(?:export|import)\s[^\n]*/m.exec(src.replace(/`(?:\\.|[^`\\])*`/g, '``'));
+  if (left) throw new Error(`${relative(root, path)}: unsupported module syntax for tools/build.mjs: "${left[0].slice(0, 80)}"`);
   mod.body = `${head.join('\n')}\n${src}`;
   order.push(mod); // post-order: dependencies are pushed first
   return mod;
@@ -74,9 +81,12 @@ const wrapped = order.map((m) =>
 const banner = `// ShaderIntel — WebGPU physics + shader library. Single-file build of src/ (${order.length} modules).\n`;
 const names = [...new Set(top.exports.map((e) => e.split(':')[0].trim()))];
 
-mkdirSync(resolve(root, 'dist'), { recursive: true });
-writeFileSync(resolve(root, 'dist/shaderintel.js'), `${banner}${wrapped}\n\nexport const { ${names.join(', ')} } = ${top.id};\n`);
-writeFileSync(resolve(root, 'dist/shaderintel.global.js'),
+// --out <dir> writes somewhere else (the unit tests build into a temporary folder and compare with dist/)
+const outArg = process.argv.indexOf('--out');
+const out = outArg > 0 ? resolve(process.argv[outArg + 1]) : resolve(root, 'dist');
+mkdirSync(out, { recursive: true });
+writeFileSync(resolve(out, 'shaderintel.js'), `${banner}${wrapped}\n\nexport const { ${names.join(', ')} } = ${top.id};\n`);
+writeFileSync(resolve(out, 'shaderintel.global.js'),
   `${banner}(function (global) {\n'use strict';\n${wrapped}\n\nglobal.SI = ${top.id};\n})(typeof globalThis !== 'undefined' ? globalThis : window);\n`);
-const kb = (f) => (readFileSync(resolve(root, f)).length / 1024).toFixed(0);
-console.log(`bundled ${order.length} modules -> dist/shaderintel.js (${kb('dist/shaderintel.js')} KB), dist/shaderintel.global.js (${kb('dist/shaderintel.global.js')} KB)`);
+const kb = (f) => (readFileSync(resolve(out, f)).length / 1024).toFixed(0);
+console.log(`bundled ${order.length} modules -> ${relative(root, out) || '.'}/shaderintel.js (${kb('shaderintel.js')} KB), shaderintel.global.js (${kb('shaderintel.global.js')} KB)`);

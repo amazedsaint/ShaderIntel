@@ -11,6 +11,8 @@
 //              lane by lane (no shared memory, no barriers) — needs a fixed
 //              subgroup size, e.g. 32 on Apple GPUs.
 // Integration: symplectic Euler (kick-drift), double-buffered positions.
+import { destroyAll } from '../core/dispose.js';
+import { SIError } from '../core/errors.js';
 
 const VARIANTS = (caps) => {
   const v = [{ mode: 'naive', wg: 256, K: 1 }];
@@ -41,6 +43,12 @@ export class NBody {
     this.vel = ctx.array('vec4f', this.count, { label: 'nbody-vel' });
     this.kernels = new Map();
     this.variant = o.variant || { mode: 'tiled', wg: 256, K: 2 };
+  }
+
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    destroyAll(this.pos, this.pos2, this.vel);
   }
 
   static variants(caps) { return VARIANTS(caps); }
@@ -104,11 +112,13 @@ ${all('          ')}
 
   /** Advance `steps` steps. */
   step(steps = 1, variant = this.variant) {
+    if (this.destroyed) throw new SIError('NBody.step: it was destroyed');
     const k = this.kernel(variant);
     const groups = Math.ceil(this.count / k.bodiesPerGroup);
     this.ctx.region('nbody', () => {
       for (let s = 0; s < steps; s++) {
-        k.dispatch(groups, { n: this.count, eps2: this.softening ** 2, G: this.G, dt: this.dt },
+        // eps2 > 0: a body's interaction with itself would be 0 · ∞ otherwise (softening 0)
+        k.dispatch(groups, { n: this.count, eps2: Math.max(this.softening ** 2, 1e-20), G: this.G, dt: this.dt },
           { pos: this.pos, posOut: this.pos2, vel: this.vel });
         [this.pos, this.pos2] = [this.pos2, this.pos];
       }
@@ -121,19 +131,35 @@ ${all('          ')}
    */
   async autotune({ reps = 4, cache = true } = {}) {
     const caps = this.ctx.caps;
-    const key = `si-nbody-v1-${caps.vendor}-${caps.architecture}-${Math.round(Math.log2(this.count))}`;
+    // the variants on offer depend on subgroup support (init({ subgroups: false }) removes some)
+    const key = `si-nbody-v2-${caps.vendor}-${caps.architecture}-sg${+caps.subgroups}-${Math.round(Math.log2(this.count))}`;
+    const offered = VARIANTS(caps);
+    const same = (a, b) => a && b && a.mode === b.mode && a.wg === b.wg && a.K === b.K;
     if (cache && typeof localStorage !== 'undefined') {
-      try { const c = JSON.parse(localStorage.getItem(key)); if (c) { this.variant = c.variant; return c.results; } } catch {}
+      try {
+        const c = JSON.parse(localStorage.getItem(key));
+        if (c && offered.some((v) => same(v, c.variant))) { this.variant = offered.find((v) => same(v, c.variant)); return c.results; }
+      } catch { /* a corrupt cache entry is re-measured */ }
     }
+    // timing steps the simulation: keep its state and put it back afterwards
+    const savedPos = this.ctx.array('vec4f', this.count, { label: 'nbody-autotune-pos' });
+    const savedVel = this.ctx.array('vec4f', this.count, { label: 'nbody-autotune-vel' });
+    this.ctx.copy(this.pos, savedPos); this.ctx.copy(this.vel, savedVel);
     const results = [];
     const n2 = this.count * this.count;
-    for (const v of VARIANTS(caps)) {
-      const k = this.kernel(v);
-      try { await k.ready(); } catch { continue; }
-      // choose a batch so each measurement is ~20 ms of GPU work
-      const ms = await timeIt(this.ctx, () => this.step(1, v), reps, n2);
-      results.push({ variant: v, ms, gips: n2 / (ms * 1e6) });
+    try {
+      for (const v of offered) {
+        const k = this.kernel(v);
+        try { await k.ready(); } catch { continue; }
+        // choose a batch so each measurement is ~20 ms of GPU work
+        const ms = await timeIt(this.ctx, () => this.step(1, v), reps, n2);
+        results.push({ variant: v, ms, gips: n2 / (ms * 1e6) });
+      }
+    } finally {
+      this.ctx.copy(savedPos, this.pos); this.ctx.copy(savedVel, this.vel);
+      savedPos.destroy(); savedVel.destroy();
     }
+    if (!results.length) throw new SIError('NBody.autotune: no kernel variant compiled on this device');
     results.sort((a, b) => a.ms - b.ms);
     this.variant = results[0].variant;
     if (cache && typeof localStorage !== 'undefined') localStorage.setItem(key, JSON.stringify({ variant: this.variant, results }));
@@ -180,6 +206,7 @@ ${all('          ')}
         vel.set([g.v[0] + vx, g.v[1] + vy, g.v[2] + vz, 0], 4 * k);
       }
     }
+    this.ctx.flush();   // recorded steps swap pos/pos2 when they run: submit them before re-initialising
     this.pos.write(pos); this.vel.write(vel);
     return this;
   }
@@ -198,6 +225,7 @@ ${all('          ')}
       pos.set([d[0] * r, d[1] * r, d[2] * r, 1 / n], 4 * k);
       vel.set([dv[0] * v, dv[1] * v, dv[2] * v, 0], 4 * k);
     }
+    this.ctx.flush();   // recorded steps swap pos/pos2 when they run: submit them before re-initialising
     this.pos.write(pos); this.vel.write(vel);
     return this;
   }

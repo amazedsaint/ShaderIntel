@@ -51,7 +51,7 @@ let ballOn = false;
 
 SI.panel('MLS-MPM', [
   { label: 'scene', options: ['dam break + jelly', 'snow + sand', 'pool + bodies'], value: current, onChange: (v) => { current = v; scene(v); } },
-  { label: 'substeps', min: 2, max: 24, step: 1, value: sim.substeps, onInput: (v) => { sim.substeps = v; sim._uploadMaterials(); } },
+  { label: 'substeps', min: 2, max: 24, step: 1, value: sim.substeps, onInput: (v) => { sim.substeps = v; } },
   { label: 'water', options: ['surface', 'particles'], onChange: (v) => {
       view.remove(layer); view.remove(water);
       layer = view.add(sim.spheres({ solidsOnly: v === 'surface' }));

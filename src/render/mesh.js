@@ -44,6 +44,9 @@ export class SurfaceMesh {
   }
   set(v) { this.program.set(v); return this; }
   draw(pass, view) {
+    if (this.o.pos.destroyed || this.o.nrm.destroyed) return;
     this.program.drawIndexed(pass, view, this.o.indices, this.o.indexCount, 1, null, { P: this.o.pos, N: this.o.nrm });
   }
+  /** Layers own no GPU memory beyond their pipeline (garbage-collected); kept for a uniform API. */
+  destroy() { this.destroyed = true; }
 }

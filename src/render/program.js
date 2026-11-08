@@ -5,6 +5,7 @@
 //   binding 2+ buffers (read-only storage), textures, samplers in declaration order
 import { structLayout, writeField } from '../core/types.js';
 import { link, constants } from '../core/wgsl.js';
+import { SIError } from '../core/errors.js';
 
 export const CAMERA_WGSL = /* wgsl */`
 struct Camera {
@@ -93,8 +94,11 @@ export class RenderProgram {
       primitive: { topology: desc.topology || 'triangle-list', cullMode: desc.cullMode || 'none' },
       depthStencil: depth,
     });
-    const scope = d.popErrorScope().then((err) => {
-      if (err) { const m = `ShaderIntel: render pipeline "${this.name}": ${err.message}`; console.error(m); throw new Error(m); }
+    const scope = d.popErrorScope().then(async (err) => {
+      if (!err) return;
+      const m = `ShaderIntel: render pipeline "${this.name}": ${err.message}`;
+      if (await ready.then(() => true, () => false)) console.error(m);   // else the WGSL errors were reported already
+      throw new SIError(m);
     });
     this._ready = Promise.all([ready, scope]);
     this._ready.catch(() => {});
@@ -109,7 +113,7 @@ export class RenderProgram {
     if (!values) return this;
     for (const [k, v] of Object.entries(values)) {
       const f = this.fieldByName.get(k);
-      if (!f) throw new Error(`ShaderIntel: program "${this.name}" has no uniform "${k}"`);
+      if (!f) throw new SIError(`ShaderIntel: program "${this.name}" has no uniform "${k}"`);
       writeField(this.uview, f, v);
     }
     return this;
@@ -139,7 +143,7 @@ export class RenderProgram {
     const off = this.ctx._ring.push(this);
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, this._bindGroup(view), [off]);
-    pass.setIndexBuffer(indexBuffer, 'uint32');
+    pass.setIndexBuffer(indexBuffer instanceof GPUBuffer ? indexBuffer : indexBuffer.buffer, 'uint32');   // a GPUBuffer or a GArray
     pass.drawIndexed(indexCount, instanceCount);
     return this;
   }
@@ -149,7 +153,7 @@ export class RenderProgram {
     let key = `${ring.gen}:${view.id}`;
     for (const s of this.slots) {
       const r = this.bound[s.name];
-      if (!r) throw new Error(`ShaderIntel: program "${this.name}": binding "${s.name}" not provided`);
+      if (!r) throw new SIError(`ShaderIntel: program "${this.name}": binding "${s.name}" not provided`);
       key += ':' + (r.id || (r.__sampler ? r.filter + r.wrap : idOf(r)));
     }
     let bg = this.bgCache.get(key);

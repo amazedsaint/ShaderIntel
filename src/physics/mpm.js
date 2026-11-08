@@ -22,8 +22,17 @@ import { Spheres } from '../render/spheres.js';
 import { FluidSurface } from '../render/fluid.js';
 import { FluidRigidCoupling } from './coupling.js';
 import '../shaders/linalg.js';
+import { destroyAll } from '../core/dispose.js';
+import { SIError } from '../core/errors.js';
 
-export const FLUID = 0, JELLY = 1, SNOW = 2, SAND = 3;
+export const FLUID = 0;
+export const JELLY = 1;
+export const SNOW = 2;
+export const SAND = 3;
+/** Material kinds by name (MaterialDef.kind accepts the number or the name). */
+export const MPM_KINDS = { fluid: FLUID, jelly: JELLY, elastic: JELLY, snow: SNOW, sand: SAND };
+const MAX_DENSITY = 50;     // relative to water; the 2^22 fixed-point grid overflows near ~300
+const MAX_VISCOSITY = 4;    // explicit viscosity is stable up to a diffusion number of ~1/6 per substep
 
 /** Material presets. stiffness ∈ (0,1] is a fraction of the max stable lattice wave speed. */
 export const MATERIALS = {
@@ -75,7 +84,7 @@ export class MPM {
    * @param {Context} ctx
    * @param {object} o
    *   maxParticles, grid: cells along the longest axis (default 64), size: [x,y,z] world size (default [1,1,1]),
-   *   origin, gravity (m/s^2), substeps (per 1/60 s), timeScale, sortEvery, ppc (particles per cell axis^3, default 8)
+   *   origin, gravity (m/s^2), substeps (per 1/60 s), timeScale, sortEvery, ppcAxis (particles per cell along each axis, default 2)
    */
   constructor(ctx, o = {}) {
     this.ctx = ctx;
@@ -87,8 +96,8 @@ export class MPM {
     this.size = this.dims.map((d) => d * this.dx);
     this.origin = o.origin || [0, 0, 0];
     this.gravity = o.gravity || [0, -9.81, 0];
-    this.substeps = o.substeps || 8;
-    this.timeScale = o.timeScale ?? 1;
+    this._substeps = Math.max(1, Math.round(o.substeps || 8));
+    this._timeScale = o.timeScale ?? 1;
     this.sortEvery = o.sortEvery || 4;
     this.ppcAxis = o.ppcAxis || 2;
     this.bound = 3;
@@ -120,13 +129,37 @@ export class MPM {
   /** World-space time step of one substep. */
   get substepDt() { return (1 / 60) * this.timeScale / this.substeps; }
 
+  /**
+   * Substeps per frame and time scale can change at any time: particle velocities are stored in
+   * cells per substep, so they are rescaled to keep their physical speed.
+   */
+  get substeps() { return this._substeps; }
+  set substeps(n) { this._retime(() => { this._substeps = Math.max(1, Math.round(n)); }); }
+  get timeScale() { return this._timeScale; }
+  set timeScale(x) { this._retime(() => { this._timeScale = Math.max(1e-6, +x); }); }
+  _retime(change) {
+    const before = this.substepDt;
+    change();
+    const k = this.substepDt / before;
+    if (this.count && this.rescaleK && Math.abs(k - 1) > 1e-12) this.rescaleK.run(this.count, { k }, { P: this.P });
+  }
+
   // ------------------------------------------------------------------ materials
   _material(nameOrDef) {
     const def = typeof nameOrDef === 'string' ? { ...MATERIALS[nameOrDef], name: nameOrDef } : { ...nameOrDef };
-    if (!def || def.kind === undefined) throw new Error(`MPM: unknown material ${nameOrDef}`);
+    if (!def || def.kind === undefined)
+      throw new SIError(`MPM: unknown material ${JSON.stringify(nameOrDef)} (use ${Object.keys(MATERIALS).join(', ')} or a definition with a kind)`, 'invalid-argument');
+    if (typeof def.kind === 'string') {
+      if (!(def.kind in MPM_KINDS)) throw new SIError(`MPM: unknown material kind "${def.kind}" (use ${Object.keys(MPM_KINDS).join(', ')})`, 'invalid-argument');
+      def.kind = MPM_KINDS[def.kind];
+    }
+    if (![FLUID, JELLY, SNOW, SAND].includes(def.kind)) throw new SIError(`MPM: material kind must be 0–3 (got ${def.kind})`, 'invalid-argument');
+    const density = def.density ?? 1;
+    if (!(density > 0 && density <= MAX_DENSITY))
+      throw new SIError(`MPM: density ${density} is outside (0, ${MAX_DENSITY}] — densities are relative to water (1), not kg/m³`, 'invalid-argument');
     const key = JSON.stringify(def);
     if (this.materialIndex.has(key)) return this.materialIndex.get(key);
-    if (this.materials.length >= 8) throw new Error('MPM: at most 8 distinct materials');
+    if (this.materials.length >= 8) throw new SIError('MPM: at most 8 distinct materials at once (clear() frees them)', 'invalid-argument');
     const idx = this.materials.length;
     this.materials.push(def);
     this.materialIndex.set(key, idx);
@@ -142,18 +175,18 @@ export class MPM {
       const mass = (m.density ?? 1) * vol;          // lattice mass: rho' = density (relative) per cell
       const rho = mass / vol;
       const c = C_MAX * Math.min(1, Math.max(0.01, m.stiffness ?? 1));
-      const nu = m.poisson ?? 0.3;
-      // P-wave modulus M = lambda + 2 mu = rho c^2; recover E, mu, lambda from Poisson's ratio.
+      const nu = Math.min(0.49, Math.max(0, m.poisson ?? 0.3));   // 0.5 (incompressible) has no shear stiffness: 0/0 below
+      // P-wave modulus M = lambda + 2 mu = rho c^2; split it by Poisson's ratio directly
+      // (through E, nu = 0.5 is 0/0): lambda = M nu / (1 - nu), mu = M (1 - 2 nu) / (2 (1 - nu)).
       const Mmod = rho * c * c;
-      const E = Mmod * (1 + nu) * (1 - 2 * nu) / (1 - nu);
-      const mu = E / (2 * (1 + nu));
-      const la = E * nu / ((1 + nu) * (1 - 2 * nu));
+      const mu = Mmod * (1 - 2 * nu) / (2 * (1 - nu));
+      const la = Mmod * nu / (1 - nu);
       const o = k * 12;
       u[o] = m.kind;
       data[o + 1] = mass;
       data[o + 2] = m.kind === FLUID ? rho * c * c : mu;   // fluids: bulk modulus K
       data[o + 3] = la;
-      data[o + 4] = (m.viscosity ?? 0) * 0.05 * rho;       // lattice dynamic viscosity
+      data[o + 4] = Math.min(MAX_VISCOSITY, Math.max(0, m.viscosity ?? 0)) * 0.05 * rho;   // lattice dynamic viscosity, clamped to what is stable
       data[o + 5] = m.hardening ?? 10;
       data[o + 6] = m.compression ?? 0.025;
       data[o + 7] = m.stretch ?? 0.0075;
@@ -161,6 +194,7 @@ export class MPM {
       const sinp = Math.sin(phi);
       data[o + 8] = Math.sqrt(2 / 3) * (2 * sinp) / (3 - sinp); // Drucker–Prager alpha
     });
+    this.ctx.flush();   // materials change between batches; recorded steps keep the old ones
     this.matBuf.write(data);
   }
 
@@ -197,8 +231,15 @@ export class MPM {
     return n;
   }
 
-  /** Remove every particle. */
-  clear() { this.count = 0; }
+  /**
+   * Remove every particle. The material table is emptied too (no particle uses it any more), so a
+   * new scene can use up to 8 materials of its own.
+   */
+  clear() {
+    this.count = 0;
+    this.materials = [];
+    this.materialIndex.clear();
+  }
 
   /**
    * Two-way coupling with a RigidWorld: bodies become moving boundaries of this material and
@@ -206,8 +247,23 @@ export class MPM {
    * then the rigid world, each frame. o: { friction, band, mask, densityScale } (see coupling.js).
    */
   couple(world, o = {}) {
+    this.coupling?.destroy();
     this.coupling = new FluidRigidCoupling(this.ctx, this, world, o);
     return this.coupling;
+  }
+
+  /** End the coupling made by couple() (bodies no longer feel the fluid, nor the fluid the bodies). */
+  decouple() {
+    this.coupling?.destroy();
+    this.coupling = null;
+  }
+
+  /** Free every GPU buffer of the simulation (and of its coupling). Layers made by fluid() / spheres() are destroyed separately. */
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    destroyAll(this.P, this.P2, this.grid, this.matBuf, this.colBuf, this.blockCount, this.key, this.rank, this.scan, this.coupling);
+    this.coupling = null;
   }
 
   // ------------------------------------------------------------------ colliders
@@ -233,7 +289,7 @@ export class MPM {
       const v = c.velocity || [0, 0, 0];
       data[o + 8] = v[0] * s; data[o + 9] = v[1] * s; data[o + 10] = v[2] * s;
     });
-    this.colBuf.write(data);
+    this.colBuf.writeOrdered(data);   // ordered: several step() calls in one batch each see their own colliders
   }
 
   // ------------------------------------------------------------------ kernels
@@ -345,6 +401,16 @@ export class MPM {
     });
 
     // --- grid update: momentum -> velocity, gravity, walls, colliders
+    // velocities (v) and velocity gradients (C) are per substep: rescale them when the substep changes
+    this.rescaleK = ctx.kernel({
+      name: 'mpm-retime', buffers: { P: { type: 'vec4f' } }, uniforms: { k: 'f32' },
+      code: /* wgsl */`
+        let b = 8u * i;
+        P[b + 1u] = vec4f(P[b + 1u].xyz * u.k, P[b + 1u].w);
+        P[b + 2u] = vec4f(P[b + 2u].xyz * u.k, P[b + 2u].w);
+        P[b + 3u] = vec4f(P[b + 3u].xyz * u.k, P[b + 3u].w);
+        P[b + 4u] = vec4f(P[b + 4u].xyz * u.k, P[b + 4u].w);`,
+    });
     this.gridK = ctx.kernel({
       ...common, name: 'mpm-grid',
       buffers: { grid: { type: 'vec4i' }, COL: { type: 'vec4f', access: 'read' } },
@@ -514,6 +580,7 @@ export class MPM {
   // ------------------------------------------------------------------ stepping
   /** Advance by one frame (1/60 s x timeScale), split into `substeps`. */
   step() {
+    if (this.destroyed) throw new SIError('MPM.step: it was destroyed');
     if (this.count === 0) return;
     const ctx = this.ctx;
     this._uploadColliders();
@@ -582,7 +649,8 @@ export class MPM {
     return {
       surface: fs,
       set(v) { fs.set(v); return this; },
-      afterScene(view) { fs.set({ matMask: sim.fluidMask() }); fs.afterScene(view); },
+      afterScene(view) { if (sim.destroyed) return; fs.set({ matMask: sim.fluidMask() }); fs.afterScene(view); },
+      destroy() { fs.destroy(); },
     };
   }
 
@@ -599,11 +667,14 @@ export class MPM {
       spheres: sp,
       set(v) { sp.set(v); return this; },
       draw(pass, view) {
+        if (sim.destroyed) return;
         if (!opts.palette) sim.palette().forEach((c, k) => sp.program.set({ ['pal' + k]: [...c, 1] }));
         sp.program.set({ matMask: opts.solidsOnly ? ~sim.fluidMask() >>> 0 : 0xffffffff });
+        sp.program.set({ velScale: sim.dx / sim.substepDt });   // substeps / timeScale may have changed
         sp.program.bind({ P: sim.P });
         sp.draw(pass, view);
       },
+      destroy() { sp.destroy(); },
     };
   }
 }

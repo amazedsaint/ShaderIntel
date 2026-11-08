@@ -28,7 +28,13 @@ export type WGSLType = 'f32' | 'u32' | 'i32' | 'f16' | 'vec2f' | 'vec3f' | 'vec4
 
 // ---------------------------------------------------------------------------------- core
 
-export class SIError extends Error {}
+/** Why a ShaderIntel call failed, for programmatic handling. */
+export type SIErrorCode = 'unsupported' | 'no-adapter' | 'no-device' | 'compile' | 'invalid-argument' | 'error';
+/** The error class for every failure ShaderIntel reports on purpose. */
+export class SIError extends Error {
+  constructor(message: string, code?: SIErrorCode);
+  readonly code: SIErrorCode;
+}
 
 export interface InitOptions {
   powerPreference?: 'high-performance' | 'low-power';
@@ -37,10 +43,19 @@ export interface InitOptions {
   f16?: boolean;
   timestamps?: boolean;
   subgroupId?: boolean;
+  /** Use a device created elsewhere (e.g. by three.js) instead of requesting one; it is not destroyed by Context.destroy(). */
+  device?: GPUDeviceT;
+  /** The adapter of `device`, when known (for caps.vendor / architecture). */
+  adapter?: GPUAdapterT | null;
 }
 
-/** Initialise WebGPU and return a Context. Throws SIError with a readable message when unavailable. */
+/**
+ * Initialise WebGPU and return a Context. Rejects with an SIError whose code is 'unsupported'
+ * (no WebGPU in this browser), 'no-adapter' or 'no-device'.
+ */
 export function init(opts?: InitOptions): Promise<Context>;
+/** True when this environment exposes WebGPU (navigator.gpu); an adapter may still be unavailable. */
+export function isSupported(): boolean;
 
 export interface Caps {
   subgroups: boolean;
@@ -59,9 +74,15 @@ export interface Caps {
 export interface ProfileEntry { label: string; ms: number; last: number; samples: number }
 
 export class Context {
-  readonly adapter: GPUAdapterT;
+  /** null when the context was created from an external device without its adapter. */
+  readonly adapter: GPUAdapterT | null;
   readonly device: GPUDeviceT;
   readonly caps: Caps;
+  readonly limits: Record<string, number>;
+  /** True after destroy() or once the device is lost. */
+  readonly destroyed: boolean;
+  /** False when the device was passed in with init({ device }). */
+  readonly ownsDevice: boolean;
   /** Preferred canvas format. */
   readonly format: string;
   readonly stats: { dispatches: number; submits: number };
@@ -74,7 +95,7 @@ export class Context {
   /** A compute kernel from the body of a WGSL function (see KernelDesc). */
   kernel(desc: KernelDesc): Kernel;
   sampler(filter?: 'linear' | 'nearest', wrap?: string): GPUSamplerT;
-  texture(desc: Record<string, unknown>): { texture: GPUTextureT; view: GPUTextureViewT; id: number; width: number; height: number; depth: number; format: string };
+  texture(desc: { size: number[]; format?: string; dimension?: '1d' | '2d' | '3d'; usage?: number; sampleCount?: number; label?: string }): TextureHandle;
   /** The command encoder of the current batch (created on demand). */
   readonly encoder: GPUCommandEncoderT;
   computePass(): GPUComputePassEncoderT;
@@ -92,8 +113,18 @@ export class Context {
   fillFloat(arr: GArray, x: number): this;
   copy(src: GArray, dst: GArray, bytes?: number, srcOffset?: number, dstOffset?: number): void;
   read(arr: GArray, count?: number): Promise<TypedArray>;
-  readTexture(tex: unknown): Promise<TypedArray>;
-  shaderModule(code: string, label?: string): GPUShaderModuleT;
+  /** Read a texture back (needs COPY_SRC); half floats are expanded. */
+  readTexture(tex: TextureHandle | GPUTextureT): Promise<{ width: number; height: number; depth: number; channels: number; data: Float32Array }>;
+  /**
+   * Write data into a buffer ordered with the recorded work: dispatches recorded before see the old
+   * contents, those recorded after see the new (queue.writeBuffer would land before all of them).
+   */
+  writeOrdered(dst: GArray | GPUBufferT, data: ArrayBufferView | ArrayLike<number>, byteOffset?: number): this;
+  shaderModule(code: string, label?: string): { module: GPUShaderModuleT; ready: Promise<void> };
+  /**
+   * Submit pending work and release the device — and with it every buffer, texture and pipeline made
+   * on it. A device passed in with init({ device }) is left alive. Idempotent.
+   */
   destroy(): void;
 
   // factories (also available as classes)
@@ -101,22 +132,29 @@ export class Context {
   rigid(opts?: RigidWorldOptions): RigidWorld;
   bodies(world: RigidWorld, opts?: BodiesOptions): Bodies;
   mpm(opts?: MPMOptions): MPM;
-  nbody(opts?: NBodyOptions): NBody;
-  cloth(opts?: Record<string, unknown>): Cloth;
-  smoke(opts?: Record<string, unknown>): Smoke;
-  boids(opts?: Record<string, unknown>): Boids;
-  sdf(opts: Record<string, unknown>): SdfScene;
-  volume(opts: Record<string, unknown>): Volume;
-  mesh(opts: Record<string, unknown>): SurfaceMesh;
-  glyphs(opts: Record<string, unknown>): Glyphs;
-  points(opts: { data: GArray; [k: string]: unknown }): Points;
-  stage(opts?: { height?: number; cell?: number; [k: string]: unknown }): Stage;
-  fullscreen(desc: Record<string, unknown>): Fullscreen;
+  nbody(opts: NBodyOptions): NBody;
+  cloth(opts?: ClothOptions): Cloth;
+  smoke(opts?: SmokeOptions): Smoke;
+  boids(opts?: BoidsOptions): Boids;
+  sdf(opts: SdfSceneOptions): SdfScene;
+  volume(opts: VolumeOptions): Volume;
+  mesh(opts: MeshOptions): SurfaceMesh;
+  glyphs(opts: GlyphsOptions): Glyphs;
+  points(opts: PointsOptions): Points;
+  stage(opts?: StageOptions): Stage;
+  fullscreen(desc: FullscreenDesc): Fullscreen;
   program(desc: Record<string, unknown>): RenderProgram;
-  spheres(opts: Record<string, unknown>): Spheres;
+  spheres(opts: SpheresOptions): Spheres;
 }
 
-export interface ArrayOptions { usage?: number; label?: string; atomic?: boolean }
+export interface ArrayOptions { usage?: number; label?: string }
+
+/** A texture with its default view (from Context.texture()). */
+export interface TextureHandle {
+  texture: GPUTextureT; view: GPUTextureViewT; id: string;
+  width: number; height: number; depth: number; format: string;
+  destroy(): void;
+}
 
 /** A typed GPU array (a storage buffer with an element type). */
 export class GArray {
@@ -129,10 +167,16 @@ export class GArray {
   readonly byteLength: number;
   readonly label: string;
   readonly buffer: GPUBufferT;
+  readonly destroyed?: boolean;
   /** Scalars per element as laid out in memory. */
   readonly slots: number;
-  /** Write elements starting at `elementOffset` (queue write: ordered before unsubmitted work — flush first if that matters). */
+  /**
+   * Write elements starting at `elementOffset` (queue write: ordered before unsubmitted work — flush
+   * first if that matters). Throws SIError('invalid-argument') if the data does not fit.
+   */
   write(data: ArrayLike<number> | ArrayBufferView, elementOffset?: number): this;
+  /** Like write(), but ordered with recorded work (see Context.writeOrdered). */
+  writeOrdered(data: ArrayLike<number> | ArrayBufferView, elementOffset?: number): this;
   /** Zero the array, recorded in order with dispatches. */
   clear(): this;
   /** Read back (flushes); vec3 elements come back padded to 4 scalars. */
@@ -148,12 +192,15 @@ export interface BufferBinding {
   array?: GArray;
   access?: 'read' | 'read_write';
   atomic?: boolean;
+  /** Bind as var<uniform> of `type` instead of a storage array. */
+  uniform?: boolean;
 }
 
 export interface KernelDesc {
   name?: string;
   /** Storage bindings: a GArray (bound by default) or a declaration. Read in WGSL by name. */
-  buffers?: Record<string, GArray | BufferBinding>;
+  /** A GArray (bound by default), a declaration, or just its WGSL element type. */
+  buffers?: Record<string, GArray | BufferBinding | WGSLType>;
   /** Uniforms: name → WGSL type; read in WGSL as u.name. */
   uniforms?: Record<string, WGSLType>;
   textures?: Record<string, unknown>;
@@ -166,9 +213,15 @@ export interface KernelDesc {
   code: string;
   /** 1 (default), 2 or 3. */
   dims?: 1 | 2 | 3;
-  workgroupSize?: number | [number, number, number];
+  workgroupSize?: number | [number, number] | [number, number, number];
   /** Skip the generated bounds check (default true: guarded). */
   guard?: boolean;
+  /** Module-scope constants: { K: 4 } → const K = 4; */
+  defines?: Record<string, number | boolean | string | number[]>;
+  /** Initial uniform values. */
+  values?: Uniforms;
+  /** false makes capability-dependent library modules emit their portable code. */
+  subgroups?: boolean;
 }
 
 export type Uniforms = Record<string, number | ArrayLike<number> | boolean>;
@@ -194,15 +247,24 @@ export class Kernel {
   dispatchIndirect(args: GArray, offset?: number, uniforms?: Uniforms | null, resources?: Resources): this;
 }
 
-export interface ModuleDef { code: string; /** Modules this one needs. */ deps?: string[]; doc?: string }
+export interface ModuleDef {
+  /** WGSL, or a function of the device capabilities returning WGSL (one name, several implementations). */
+  code: string | ((caps: Caps) => string);
+  /** Modules this one needs. */
+  deps?: string[];
+  doc?: string;
+}
 /** Register a WGSL module that kernels can import by name. */
 export function defineModule(name: string, def: string | ModuleDef): void;
 export function link(code: string, imports?: string[], caps?: Partial<Caps>): string;
 export function moduleNames(): string[];
 export function moduleInfo(name: string): unknown;
-export function literal(x: number | number[], type?: string): string;
+export function literal(x: number | boolean, type?: 'f32' | 'i32' | 'u32'): string;
 export function layoutOf(type: string): { type: string; stride: number; components: number; scalar: string; [k: string]: unknown };
-export function structLayout(fields: Record<string, string>): unknown;
+export function structLayout(name: string, members: Record<string, WGSLType>): {
+  name: string; size: number; align: number; wgsl: string;
+  fields: Array<{ name: string; type: string; offset: number; layout: unknown }>;
+};
 export function toHalf(x: number): number;
 export function fromHalf(h: number): number;
 
@@ -211,12 +273,16 @@ export function fromHalf(h: number): number;
 /** Exclusive prefix sum of u32 values (reduce-then-scan, or single-pass decoupled look-back). */
 export class Scan {
   constructor(ctx: Context, maxN: number, o?: { mode?: 'reduce-then-scan' | 'single-pass'; lookback?: 'thread' | 'workgroup' | 'subgroup'; spins?: number });
-  run(src: GArray, dst?: GArray, n?: number): void;
+  /** Returns dst. */
+  run(src: GArray, dst?: GArray, n?: number): GArray;
+  destroy(): void;
 }
 
 export class Reduce {
-  constructor(ctx: Context, o: { type: WGSLType; input?: WGSLType; op?: 'sum' | 'min' | 'max'; map?: string; maxN?: number });
-  run(src: GArray, n?: number): unknown;
+  constructor(ctx: Context, o?: { type?: WGSLType; input?: WGSLType; op?: 'sum' | 'min' | 'max'; map?: string; maxN?: number });
+  /** The 1-element result array (on the GPU); n = 0 gives the identity; n > maxN throws. */
+  run(src: GArray, n?: number): GArray;
+  destroy(): void;
   read(): Promise<number | number[]>;
 }
 
@@ -239,69 +305,293 @@ export function timeIt(ctx: Context, fn: () => unknown, reps?: number, workHint?
 
 // ---------------------------------------------------------------------------------- rendering
 
+export type Tonemap = 'agx' | 'aces' | 'neutral' | 'reinhard' | 'none';
+
+export interface CameraOptions {
+  target?: number[];
+  distance?: number;
+  /** Radians around the y axis. */
+  yaw?: number;
+  /** Radians above the horizon. */
+  pitch?: number;
+  /** Vertical field of view in degrees (default 45). */
+  fov?: number;
+  near?: number;
+  far?: number;
+  minDistance?: number;
+  maxDistance?: number;
+  minPitch?: number;
+  maxPitch?: number;
+  /** Radians per second. */
+  autoRotate?: number;
+  /** Higher settles faster (default 8). */
+  damping?: number;
+  rotateSpeed?: number;
+  zoomSpeed?: number;
+  panSpeed?: number;
+  /** false ignores input without detaching the listeners. */
+  enabled?: boolean;
+}
+
 export interface ViewOptions {
-  camera?: { target?: number[]; distance?: number; yaw?: number; pitch?: number; fov?: number; near?: number; far?: number; minDistance?: number; maxDistance?: number };
-  hud?: boolean;
+  camera?: CameraOptions;
+  /** Mouse / touch orbit controls (default true). */
+  controls?: boolean;
+  /** Stats overlay (FPS, per-region GPU times); { extra: () => lines, parent } to customise. */
+  hud?: boolean | { extra?: () => string | string[]; parent?: HTMLElement };
+  bloom?: boolean | { strength?: number; [k: string]: unknown };
+  /** Linear RGBA clear colour. */
   background?: number[];
   exposure?: number;
-  tonemap?: string;
+  tonemap?: Tonemap;
+  /** Fixed device-pixel ratio (default: the screen's, capped at maxPixelRatio, followed when it changes). */
   pixelRatio?: number;
-  controls?: boolean;
+  maxPixelRatio?: number;
+  /** Receives errors thrown by the frame callback or rendering (the loop stops); default: an overlay on the canvas. */
+  onError?: (error: Error) => void;
 }
 
-export interface Layer { attach?(view: View): void; draw?(pass: GPURenderPassEncoderT, view: View): void; [k: string]: unknown }
+/** What View.run's callback receives. */
+export interface FrameInfo { dt: number; time: number; frame: number; view: View }
 
+/** Anything a View can draw. Every method is optional. */
+export interface Layer {
+  /** Record compute or off-screen work before the scene pass. */
+  prepare?(view: View): void;
+  /** Draw into the HDR scene pass (rgba16float + depth32float). */
+  draw?(pass: GPURenderPassEncoderT, view: View): void;
+  /** Screen-space effects after the scene (water surfaces, volumes). */
+  afterScene?(view: View): void;
+  /** Draw after tonemapping, straight into the canvas. */
+  overlay?(pass: GPURenderPassEncoderT, view: View): void;
+  resize?(view: View): void;
+  attach?(view: View): void;
+  detach?(view: View): void;
+  destroy?(): void;
+}
+
+export interface Pointer {
+  /** CSS pixels from the canvas's top-left corner. */
+  x: number; y: number;
+  /** Normalised device coordinates ([-1, 1], y up). */
+  ndc: [number, number];
+  down: boolean; buttons: number; inside: boolean;
+  shift: boolean; alt: boolean; ctrl: boolean;
+}
+
+/** A canvas with an HDR scene target, an orbit camera, tonemapping, optional bloom and HUD, and a frame loop. */
 export class View {
   constructor(ctx: Context, canvas: string | HTMLCanvasElement, opts?: ViewOptions);
+  readonly ctx: Context;
+  readonly id: string;
   readonly canvas: HTMLCanvasElement;
   readonly camera: OrbitCamera;
-  hud: Hud;
-  add<L>(layer: L): L;
-  remove(layer: unknown): void;
+  readonly pointer: Pointer;
+  readonly layers: ReadonlyArray<Layer>;
+  /** Drawing-buffer size in device pixels. */
+  readonly width: number;
+  readonly height: number;
+  readonly pixelRatio: number;
+  readonly time: number;
+  readonly frame: number;
+  readonly dt: number;
+  readonly hud: Hud | null;
+  readonly bloom: Bloom | null;
+  readonly destroyed: boolean;
+  /** True while the frame loop is scheduled. */
+  readonly running: boolean;
+  exposure: number;
+  tonemap: Tonemap;
+  background: number[];
+  onError: ((error: Error) => void) | null;
+  /** Called before every frame (set by run(fn), or directly). */
+  onFrame: ((frame: FrameInfo) => void) | null;
+  readonly view: Float32Array; readonly proj: Float32Array; readonly viewProj: Float32Array; readonly invViewProj: Float32Array;
+  /** Add a layer (idempotent); returns it. */
+  add<L extends Layer | object>(layer: L): L;
+  /** Remove a layer without destroying it; returns it. */
+  remove<L>(layer: L): L;
   /** World-space ray through a point in normalised device coordinates (default: the pointer). */
   ray(ndc?: number[]): { origin: Vec3; dir: Vec3 };
-  render(): void;
-  /** Start the frame loop; update({ dt, time, frame, view }) runs before every render. */
-  run(update?: (frame: { dt: number; time: number; frame: number; view: View }) => void): void;
-  stop(): void;
-  /** Advance one frame by hand (tests, offline rendering). */
-  step(dt?: number): void;
+  /** Record and submit one frame. */
+  render(): this;
+  /** Start or resume the frame loop; update runs before every render (run() without an argument keeps the current one). */
+  run(update?: (frame: FrameInfo) => void): this;
+  /** Pause the frame loop (run() resumes it). */
+  stop(): this;
+  /** Advance one frame by hand (tests, offline rendering, frameloop "never"). */
+  step(dt?: number): this;
+  setBloom(o: boolean | { strength?: number; [k: string]: unknown }): this;
+  setHud(o: boolean | { extra?: () => string | string[]; parent?: HTMLElement }): this;
+  setPixelRatio(ratio: number): this;
+  /** Stop the loop, remove listeners and the HUD, unconfigure the canvas, free the view's textures; { layers: true } also destroys the layers. */
+  destroy(opts?: { layers?: boolean }): void;
 }
-export class OrbitCamera { target: number[]; distance: number; yaw: number; pitch: number; update(dt: number): void; eye(): Vec3 }
-export class Hud { extra?: () => string[] }
+
+/** Orbit camera with damping: drag rotates, right/shift-drag pans, wheel/pinch zooms. */
+export class OrbitCamera {
+  constructor(el: HTMLElement, o?: CameraOptions);
+  target: number[];
+  distance: number;
+  yaw: number;
+  pitch: number;
+  /** Vertical field of view in radians (fov: the same in degrees). */
+  fovY: number;
+  fov: number;
+  near: number; far: number;
+  minDistance: number; maxDistance: number; minPitch: number; maxPitch: number;
+  autoRotate: number; damping: number; rotateSpeed: number; zoomSpeed: number; panSpeed: number;
+  enabled: boolean;
+  /** Apply any CameraOptions at once (resets the damping velocity). */
+  set(o: CameraOptions): this;
+  attach(): this;
+  detach(): this;
+  update(dt: number): void;
+  eye(): Vec3;
+}
+export class Hud { extra: (() => string | string[]) | null; readonly el: HTMLElement; destroy(): void }
 
 export interface BodiesOptions { groups?: number; [k: string]: unknown }
 /** Draws every body of a RigidWorld (boxes, spheres and ray-cast capsules) straight from GPU memory. */
-export class Bodies {
+export class Bodies implements RenderLayer {
   constructor(ctx: Context, world: RigidWorld, o?: BodiesOptions);
   set(values: Uniforms): this;
+  draw(pass: GPURenderPassEncoderT, view: View): void;
+  destroy(): void;
 }
 
-/** Render layers: construct with a Context and options, then view.add(layer). */
-export interface RenderLayer { set(values: Uniforms): this; draw?(pass: GPURenderPassEncoderT, view: View): void }
+/** Render layers: construct with a Context and options, then view.add(layer). destroy() frees what the layer allocated itself. */
+export interface RenderLayer extends Layer { set(values: Uniforms): this; destroy(): void }
 export class RenderProgram {
   constructor(ctx: Context, desc: Record<string, unknown>);
   ready(): Promise<void>;
   set(values: Uniforms): this;
   bind(resources: Resources): this;
-  draw(pass: GPURenderPassEncoderT, view: View, vertexCount: number, instanceCount?: number, uniforms?: Uniforms, resources?: Resources): void;
-  drawIndexed(pass: GPURenderPassEncoderT, view: View, indexBuffer: unknown, indexCount: number, instanceCount?: number, uniforms?: Uniforms, resources?: Resources): void;
+  draw(pass: GPURenderPassEncoderT, view: View, vertexCount: number, instanceCount?: number, uniforms?: Uniforms | null, resources?: Resources): this;
+  drawIndexed(pass: GPURenderPassEncoderT, view: View, indexBuffer: unknown, indexCount: number, instanceCount?: number, uniforms?: Uniforms | null, resources?: Resources): this;
+}
+
+export interface FullscreenDesc {
+  /** WGSL defining fn shade(uv: vec2f, px: vec2f) -> vec4f (or -> FsFrag with writeDepth); cameraRay(uv), worldDepth(p), cam.* and u.* are available. */
+  code: string;
+  name?: string;
+  imports?: string[];
+  uniforms?: Record<string, WGSLType>;
+  values?: Uniforms;
+  defines?: Record<string, number | boolean | string | number[]>;
+  buffers?: Record<string, GArray | BufferBinding>;
+  textures?: Record<string, unknown>;
+  samplers?: Record<string, unknown>;
+  writeDepth?: boolean;
+  targets?: unknown[];
 }
 export class Fullscreen implements RenderLayer {
-  constructor(ctx: Context, desc: Record<string, unknown>);
-  ready(): Promise<void>; set(values: Uniforms): this; bind(resources: Resources): this; draw(pass: GPURenderPassEncoderT, view: View): void;
+  constructor(ctx: Context, desc: FullscreenDesc);
+  ready(): Promise<void>; set(values: Uniforms): this; bind(resources: Resources): this; draw(pass: GPURenderPassEncoderT, view: View): void; destroy(): void;
 }
-export class Points implements RenderLayer { constructor(ctx: Context, o: { data: GArray; [k: string]: unknown }); set(values: Uniforms): this; bind(resources: Resources): this; draw(pass: GPURenderPassEncoderT, view: View): void }
-export class Spheres implements RenderLayer { constructor(ctx: Context, o: Record<string, unknown>); set(values: Uniforms): this; draw(pass: GPURenderPassEncoderT, view: View): void }
-export class Glyphs implements RenderLayer { constructor(ctx: Context, o: Record<string, unknown>); set(values: Uniforms): this; draw(pass: GPURenderPassEncoderT, view: View): void }
-export class SurfaceMesh implements RenderLayer { constructor(ctx: Context, o: Record<string, unknown>); set(values: Uniforms): this; draw(pass: GPURenderPassEncoderT, view: View): void }
-export class Stage implements RenderLayer { constructor(ctx: Context, o?: { height?: number; cell?: number; [k: string]: unknown }); set(values: Uniforms): this; draw(pass: GPURenderPassEncoderT, view: View): void }
-export class Lines implements RenderLayer { constructor(ctx: Context, o: Record<string, unknown>); set(values: Uniforms): this; draw(pass: GPURenderPassEncoderT, view: View): void }
+
+interface ParticleSource {
+  /** vec4f array holding the particles. */
+  data: GArray;
+  /** vec4s per particle (default 1) and the vec4 index of the position (default 0). */
+  stride?: number;
+  position?: number;
+  /** vec4 index of the velocity, or -1 (default). */
+  velocity?: number;
+  /** Particles to draw (default: the whole array); a function is read every frame. */
+  count?: number | (() => number);
+  scale?: number;
+  offset?: number[];
+}
+export interface PointsOptions extends ParticleSource {
+  /** World-space size (default 0.01), never below pixelSize pixels (default 1.5). */
+  size?: number;
+  pixelSize?: number;
+  color?: number[];
+  colorBy?: 'constant' | 'speed' | 'w';
+  speedScale?: number;
+  intensity?: number;
+}
+export class Points implements RenderLayer { constructor(ctx: Context, o: PointsOptions); readonly count: number; set(values: Uniforms): this; bind(resources: Resources): this; draw(pass: GPURenderPassEncoderT, view: View): void; destroy(): void }
+export interface SpheresOptions extends ParticleSource {
+  radius?: number;
+  /** WGSL expression of px: vec4f giving a u32 palette index. */
+  material?: string;
+  /** WGSL boolean expression of px: draw the particle or not. */
+  mask?: string;
+  palette?: number[][];
+  colorBy?: 'material' | 'speed' | 'height';
+  speedScale?: number;
+  velScale?: number;
+  sun?: number[];
+  ambient?: number;
+  matMask?: number;
+}
+export class Spheres implements RenderLayer { constructor(ctx: Context, o: SpheresOptions); readonly count: number; set(values: Uniforms): this; draw(pass: GPURenderPassEncoderT, view: View): void; destroy(): void }
+export interface GlyphsOptions { pos: GArray; vel: GArray; count?: number | (() => number); size?: number; colorBy?: 'constant' | 'speed' | 'heading'; color?: number[]; speedScale?: number }
+export class Glyphs implements RenderLayer { constructor(ctx: Context, o: GlyphsOptions); readonly count: number; set(values: Uniforms): this; draw(pass: GPURenderPassEncoderT, view: View): void; destroy(): void }
+export interface MeshOptions {
+  /** vec4f positions and normals of a grid of vertices, and a u32 index buffer. */
+  pos: GArray; nrm: GArray; indices: GPUBufferT; indexCount: number;
+  /** [columns, rows] of the vertex grid (for the checker pattern). */
+  grid?: number[];
+  front?: number[]; back?: number[];
+  pattern?: 'checker' | 'plain';
+  tiles?: number;
+  roughness?: number;
+}
+export class SurfaceMesh implements RenderLayer { constructor(ctx: Context, o: MeshOptions); set(values: Uniforms): this; draw(pass: GPURenderPassEncoderT, view: View): void; destroy(): void }
+export interface StageOptions {
+  /** Floor height (default 0). */
+  height?: number;
+  /** Grid cell size (default 0.1). */
+  cell?: number;
+  groundColor?: number[]; lineColor?: number[]; skyTop?: number[]; skyBottom?: number[];
+  fog?: number;
+  sun?: number[];
+}
+export class Stage implements RenderLayer { constructor(ctx: Context, o?: StageOptions); set(values: Uniforms): this; draw(pass: GPURenderPassEncoderT, view: View): void; destroy(): void }
+export class Lines implements RenderLayer {
+  constructor(ctx: Context, o: { points: Float32Array | number[]; color?: number[] });
+  set(values: Uniforms): this; draw(pass: GPURenderPassEncoderT, view: View): void; destroy(): void;
+  /** The twelve edges of an axis-aligned box. */
+  static box(ctx: Context, min: number[], max: number[], color?: number[]): Lines;
+}
+export interface SdfSceneOptions {
+  /** WGSL defining fn map(p: vec3f) -> vec2f (distance, material id) and optionally fn material(id, p, n) -> Material. */
+  code: string;
+  imports?: string[];
+  uniforms?: Record<string, WGSLType>;
+  values?: Uniforms;
+  /** Cone-marching tile in pixels (default 4). */
+  tile?: number;
+  shadows?: boolean;
+  ao?: boolean;
+  maxDistance?: number;
+  sun?: number[];
+  sunRadiance?: number[];
+  fog?: number;
+}
+export class SdfScene implements RenderLayer { constructor(ctx: Context, o: SdfSceneOptions); set(values: Uniforms): this; prepare(view: View): void; draw(pass: GPURenderPassEncoderT, view: View): void; destroy(): void }
+export interface FluidSurfaceOptions extends Omit<ParticleSource, 'data'> {
+  data: GArray | (() => GArray);
+  radius?: number;
+  mask?: string;
+  tint?: number[];
+  absorb?: number[];
+  refraction?: number;
+  filterRadius?: number;
+  iterations?: number;
+  thicknessScale?: number;
+  maxPixels?: number;
+  sun?: number[];
+}
 /** Screen-space fluid surface (a post-scene layer). */
-export class FluidSurface { constructor(ctx: Context, o: Record<string, unknown>); set(values: Uniforms): this; afterScene(view: View): void }
+export class FluidSurface implements RenderLayer { constructor(ctx: Context, o: FluidSurfaceOptions); set(values: Uniforms): this; afterScene(view: View): void; destroy(): void }
+export interface VolumeOptions { smoke: Smoke; density?: number; emission?: number; tint?: number[]; g?: number; ambient?: number; sun?: number[]; sunColor?: number[] }
 /** Volumetric smoke rendering (a post-scene layer). */
-export class Volume { constructor(ctx: Context, o: Record<string, unknown>); set(values: Uniforms): this; prepare(): void; afterScene(view: View): void }
-export class Bloom { constructor(ctx: Context, o?: Record<string, unknown>); run(hdr: unknown): void }
+export class Volume implements RenderLayer { constructor(ctx: Context, o: VolumeOptions); set(values: Uniforms): this; prepare(): void; afterScene(view: View): void; destroy(): void }
+export class Bloom { constructor(ctx: Context, o?: { strength?: number; [k: string]: unknown }); strength: number; run(hdr: unknown): unknown; destroy(): void }
 
 export interface PanelControl {
   label?: string;
@@ -403,7 +693,8 @@ export interface JointOptions {
   collideConnected?: boolean;
 }
 
-export interface RayHit { hit: boolean; body: number; distance: number; point: Vec3; normal: Vec3 }
+/** A ray-cast result; point and normal are only present on a hit. */
+export interface RayHit { hit: boolean; body: number; distance: number; point?: Vec3; normal?: Vec3 }
 export interface RigidSnapshot { readonly [k: string]: unknown }
 export interface RigidState {
   version: number; frame: number; count: number; contactCount: number; tableSize: number;
@@ -439,7 +730,8 @@ export class RigidWorld {
   /** A capsule along its local y axis. */
   addCapsule(o: BodyOptions & { radius: number; halfHeight?: number }): number;
   remove(id: number): void;
-  setPose(id: number, position?: number[] | null, rotation?: Rotation | null): void;
+  /** Teleport a body (ids that do not exist throw). */
+  setPose(id: number, position: number[], rotation?: Rotation | null): void;
   setVelocity(id: number, v: number[], w?: number[]): void;
   applyImpulse(id: number, J: number[], point?: number[]): void;
   applyForce(id: number, F: number[], point?: number[], dt?: number): void;
@@ -453,8 +745,12 @@ export class RigidWorld {
 
   addJoint(o: JointOptions): number;
   /** Target speed (rad/s or m/s) and force limit; speed null turns the motor off. */
+  /** Target speed (rad/s or m/s) and force limit (default: the joint's current limit); speed null turns the motor off. */
   setMotor(joint: number, speed: number | null, maxForce?: number): void;
-  setLimits(joint: number, lo: number | null, hi?: number): void;
+  /** Limits in rad (hinge) or m (slider), lo ≤ hi. */
+  setLimits(joint: number, lo: number, hi: number): void;
+  /** Remove the limits. */
+  setLimits(joint: number, lo: null): void;
   setJointEnabled(joint: number, on: boolean): void;
 
   /** WGSL run for every dynamic body before each frame; it adds to `force` / `torque` (world, N and N·m). */
@@ -479,7 +775,7 @@ export class RigidWorld {
   /** 64-bit hash of every body's pose and velocity (hex); equal states give equal hashes. */
   hash(): Promise<string>;
   /** Record the hash computation now, of the live state or of a snapshot, into a u32 array. */
-  hashRecord(target?: GArray, snap?: RigidSnapshot | null): void;
+  hashRecord(target?: GArray, snap?: RigidSnapshot | null): GArray;
   /** Capture everything the next step depends on (GPU copies; pass an old snapshot to reuse its buffers). */
   snapshot(into?: RigidSnapshot): RigidSnapshot;
   restore(s: RigidSnapshot): void;
@@ -487,6 +783,10 @@ export class RigidWorld {
   exportState(snap?: RigidSnapshot | null): Promise<RigidState>;
   /** Restore an exported state exactly (both worlds need the same maxBodies / maxContacts). */
   importState(st: RigidState): void;
+  readonly destroyed: boolean;
+  readonly maxJoints: number;
+  /** Free every GPU buffer the world allocated (snapshots you took are yours to destroy). Idempotent. */
+  destroy(): void;
 }
 
 /** Batched GPU ray casts; rays can be written by the CPU or by other kernels. */
@@ -499,6 +799,7 @@ export class RayQuery {
   set(list: Array<{ origin: number[]; dir: number[]; maxDistance?: number; mask?: number }>): this;
   run(count?: number): this;
   read(count?: number): Promise<RayHit[]>;
+  destroy(): void;
 }
 
 export function eulerQuat(angles: number[]): Quat;
@@ -509,42 +810,90 @@ export const JOINT_FLAGS: { broken: 1; collide: 2; limit: 4; motor: 8; rope: 16;
 
 // ---------------------------------------------------------------------------------- particles & fields
 
-export interface MaterialDef { kind?: number; E?: number; nu?: number; density?: number; color?: number[]; [k: string]: unknown }
-export const MATERIALS: Record<string, MaterialDef>;
+export interface MaterialDef {
+  /** 0 fluid, 1 Neo-Hookean solid (jelly, rubber), 2 snow, 3 sand — or the name ('fluid', 'jelly', 'snow', 'sand'). */
+  kind: number | 'fluid' | 'jelly' | 'elastic' | 'snow' | 'sand';
+  density?: number;
+  /** Fraction (0, 1] of the stiffest stable wave speed. */
+  stiffness?: number;
+  poisson?: number;
+  viscosity?: number;
+  hardening?: number; compression?: number; stretch?: number;
+  /** Sand: friction angle in degrees. */
+  friction?: number;
+  /** Linear RGB for the renderers. */
+  color?: number[];
+  [k: string]: unknown;
+}
+export const MATERIALS: Record<'water' | 'oil' | 'honey' | 'jelly' | 'rubber' | 'snow' | 'sand', MaterialDef>;
+/** Material kinds by name; MaterialDef.kind accepts the number or the name. */
+export const MPM_KINDS: { fluid: 0; jelly: 1; elastic: 1; snow: 2; sand: 3 };
 
 export interface MPMOptions {
+  /** Particle capacity (default 262144). */
   maxParticles?: number;
   /** Cells along the longest axis (default 64). */
   grid?: number;
-  size?: number[];
+  /** World size [x, y, z] or a cube edge (default 1). */
+  size?: number[] | number;
   origin?: number[];
   gravity?: number[];
+  /** Substeps per 1/60 s frame (default 8): more give stiffer, less compressible materials. */
   substeps?: number;
   timeScale?: number;
+  /** Re-sort particles every this many substeps (default 4). */
   sortEvery?: number;
-  ppc?: number;
+  /** Particles per cell along each axis when filling shapes (default 2, i.e. 8 per cell). */
+  ppcAxis?: number;
 }
 
-/** MLS-MPM continuum simulation (water, jelly, snow, sand). */
+export type MPMShape =
+  | { box: [number[], number[]]; material?: string | MaterialDef; velocity?: number[] }
+  | { sphere: [number[], number]; material?: string | MaterialDef; velocity?: number[] }
+  | { cylinder: [number[], number, number]; material?: string | MaterialDef; velocity?: number[] }
+  | { sdf: (p: number[]) => number; bounds: [number[], number[]]; material?: string | MaterialDef; velocity?: number[] }
+  | { points: Float32Array | number[]; material?: string | MaterialDef; velocity?: number[] };
+
+/** MLS-MPM continuum simulation (water, oil, honey, jelly, rubber, snow, sand). */
 export class MPM {
   constructor(ctx: Context, o?: MPMOptions);
   readonly count: number;
+  readonly maxParticles: number;
+  /** Cell size (world units) and grid dimensions. */
   readonly dx: number;
+  readonly dims: number[];
+  readonly size: number[];
+  readonly origin: number[];
   readonly bound: number;
   substeps: number;
+  timeScale: number;
+  sortEvery: number;
+  gravity: number[];
   readonly substepDt: number;
+  /** The particle buffer (8 vec4 per particle, lattice units); it is swapped by the sort. */
+  readonly P: GArray;
+  readonly materials: ReadonlyArray<MaterialDef>;
+  coupling: FluidRigidCoupling | null;
   /** Fill a region with particles; returns how many were added. */
-  add(shape: { box?: [number[], number[]]; sphere?: [number[], number]; cylinder?: [number[], number, number]; points?: ArrayLike<number>[]; material?: string; velocity?: number[] },
-      opts?: { material?: string | MaterialDef; velocity?: number[]; jitter?: number; seed?: number }): number;
+  add(shape: MPMShape, opts?: { material?: string | MaterialDef; velocity?: number[]; jitter?: number; seed?: number }): number;
+  /** Remove every particle (and forget the materials, so a new scene can use up to 8 others). */
   clear(): void;
   /** Two-way coupling with a RigidWorld: bodies are moving boundaries and receive the fluid's momentum. */
   couple(world: RigidWorld, o?: CouplingOptions): FluidRigidCoupling;
-  setColliders(list: unknown[]): void;
+  /** End the coupling made by couple(). */
+  decouple(): void;
+  /** Kinematic colliders re-uploaded every step: { type: 'sphere' | 'box' | 'plane', center, radius | half | normal, velocity, friction }. */
+  setColliders(list: Array<Record<string, unknown>>): void;
+  /** One frame: `substeps` substeps. */
   step(): void;
   readPositions(): Promise<Float32Array>;
-  /** A surface or particle renderer for this simulation. */
-  fluid(opts?: Record<string, unknown>): unknown;
-  spheres(opts?: Record<string, unknown>): unknown;
+  palette(): number[][];
+  fluidMask(): number;
+  /** A screen-space water surface for the liquid materials. */
+  fluid(opts?: Partial<FluidSurfaceOptions>): Layer & { surface: FluidSurface; set(values: Uniforms): unknown };
+  /** Spheres for the particles; solidsOnly skips liquids (pair with fluid()). */
+  spheres(opts?: Partial<SpheresOptions> & { solidsOnly?: boolean; size?: number }): Layer & { spheres: Spheres; set(values: Uniforms): unknown };
+  destroy(): void;
 }
 
 export interface CouplingOptions {
@@ -558,26 +907,117 @@ export interface CouplingOptions {
 }
 export class FluidRigidCoupling {
   constructor(ctx: Context, sim: MPM, world: RigidWorld, o?: CouplingOptions);
+  destroy(): void;
 }
 
-export interface NBodyOptions { count: number; G?: number; softening?: number; dt?: number; variant?: unknown }
+export interface NBodyOptions {
+  count: number;
+  /** Gravitational constant (default 1), Plummer softening (default 0.02), time step (default 0.002). */
+  G?: number; softening?: number; dt?: number;
+  variant?: unknown;
+}
 export class NBody {
-  constructor(ctx: Context, o?: NBodyOptions);
+  constructor(ctx: Context, o: NBodyOptions);
+  readonly count: number;
+  /** Current positions (double-buffered: re-read it every frame). */
   readonly pos: GArray;
   readonly vel: GArray;
-  plummer(o?: { scale?: number }): void;
+  G: number; softening: number; dt: number;
+  galaxies(o?: { seed?: number; [k: string]: unknown }): this;
+  plummer(o?: { seed?: number; scale?: number }): this;
   step(n?: number, variant?: unknown): void;
-  autotune(o?: { cache?: boolean; reps?: number }): Promise<unknown>;
+  /** Time every kernel variant on this GPU (cached per adapter); results sorted fastest first. */
+  autotune(o?: { cache?: boolean; reps?: number }): Promise<Array<{ variant: { mode: string; wg: number; K: number }; ms: number; gips: number }>>;
+  destroy(): void;
 }
-export class Cloth { constructor(ctx: Context, o?: Record<string, unknown>); step(dt?: number): void }
-export class Smoke { constructor(ctx: Context, o?: Record<string, unknown>); step(dt?: number): void }
-export class Boids { constructor(ctx: Context, o?: Record<string, unknown>); step(dt?: number): void }
-export class SdfScene { constructor(ctx: Context, o: Record<string, unknown>) }
+
+export interface ClothCollider { type: 'sphere' | 'box' | 'plane' | string; center?: number[]; radius?: number; half?: number[]; normal?: number[]; [k: string]: unknown }
+export interface ClothOptions {
+  /** Particles across and down (default 128 × 128). */
+  width?: number; height?: number;
+  /** World size [x, y] (default [1.6, 1.6]) and the top-left corner. */
+  size?: number[]; origin?: number[];
+  /** Pinned particles: 'top' (default), 'top-sparse', 'corners', 'none' or (i, j) => boolean. */
+  pin?: 'top' | 'top-sparse' | 'corners' | 'none' | ((i: number, j: number) => boolean);
+  substeps?: number;
+  /** XPBD compliances (m/N): 0 is inextensible. */
+  stretch?: number; shear?: number; bend?: number;
+  gravity?: number[];
+  damping?: number;
+  wind?: number[];
+  windNoise?: number;
+  colliders?: ClothCollider[];
+  friction?: number;
+  thickness?: number;
+}
+export class Cloth {
+  constructor(ctx: Context, o?: ClothOptions);
+  readonly W: number; readonly H: number; readonly count: number;
+  readonly pos: GArray; readonly nrm: GArray; readonly indices: GPUBufferT; readonly indexCount: number;
+  substeps: number; wind: number[]; windNoise: number; gravity: number[]; damping: number; friction: number;
+  colliders: ClothCollider[];
+  compliance: { stretch: number; shear: number; bend: number };
+  /** Floor height, or null for none. */
+  floorY: number | null;
+  origin: number[];
+  reset(pin?: ClothOptions['pin']): void;
+  step(dt?: number): void;
+  destroy(): void;
+}
+
+export interface SmokeSource { center: number[]; radius: number; density?: number; temperature?: number; velocity?: number[] }
+export interface SmokeOptions {
+  /** Cells along the longest axis (default 64). */
+  res?: number;
+  size?: number[];
+  origin?: number[];
+  /** Pressure solver sweeps (default 24) and SOR factor (default 1.8). */
+  iterations?: number;
+  omega?: number;
+  vorticity?: number;
+  buoyancy?: number;
+  weight?: number;
+  cooling?: number;
+  dissipation?: number;
+  sources?: SmokeSource[];
+}
+export class Smoke {
+  constructor(ctx: Context, o?: SmokeOptions);
+  readonly dims: number[]; readonly dx: number; readonly size: number[]; readonly origin: number[];
+  iterations: number; omega: number; vorticity: number; buoyancy: number; weight: number; cooling: number; dissipation: number;
+  sources: SmokeSource[];
+  reset(): void;
+  step(dt?: number): void;
+  destroy(): void;
+}
+
+export interface BoidsOptions {
+  count?: number;
+  /** Half-size of the cube they live in (default 1). */
+  bounds?: number;
+  /** Perception radius (default 0.06). */
+  radius?: number;
+  maxSpeed?: number; minSpeed?: number;
+  separation?: number; alignment?: number; cohesion?: number;
+  maxNeighbors?: number;
+  wall?: number;
+}
+export class Boids {
+  constructor(ctx: Context, o?: BoidsOptions);
+  readonly count: number;
+  readonly pos: GArray; readonly vel: GArray;
+  params: { radius: number; maxSpeed: number; minSpeed: number; separation: number; alignment: number; cohesion: number; maxNeighbors: number;
+    wall: number; predator: number[]; predatorRadius: number; predatorForce: number };
+  /** Scatter the flock (positions and headings) from a seed. */
+  randomize(seed?: number): this;
+  step(dt?: number): void;
+  destroy(): void;
+}
 
 // ---------------------------------------------------------------------------------- neural networks
 
 export type Activation = 'none' | 'relu' | 'leaky' | 'tanh' | 'sigmoid' | 'sin' | 'gelu';
-export interface GemmConfig { BM: number; BN: number; BK: number; TM: number; TN: number }
+export interface GemmConfig { BM: number; BN: number; BK: number; TM: number; TN: number; prefetch?: boolean }
 export interface GemmOptions {
   M: number; N: number; K: number;
   transA?: boolean; transB?: boolean;
@@ -608,6 +1048,11 @@ export interface MLPOptions {
 }
 export class MLP {
   constructor(ctx: Context, o: MLPOptions);
+  readonly ctx: Context;
+  readonly maxBatch: number;
+  readonly layers: ReadonlyArray<nn.Dense>;
+  /** The Fourier-feature encoder, when `fourier` was given. */
+  readonly encoder: nn.FourierFeatures | null;
   /** Write inputs here ([batch × layers[0]]). */
   readonly input: GArray;
   /** The last forward pass's outputs ([batch × out]). */
@@ -617,15 +1062,27 @@ export class MLP {
   forward(X?: GArray, batch?: number): GArray;
   /** Back-propagate dLoss/dOutput; overwrites every layer's gradients (params[k].g). */
   backward(dY: GArray, batch: number): void;
+  /** Free every buffer of the network. */
+  destroy(): void;
 }
 export class Adam {
   constructor(ctx: Context, params: Param[], o?: { lr?: number; beta1?: number; beta2?: number; eps?: number; weightDecay?: number; clip?: number });
-  lr: number;
+  lr: number; beta1: number; beta2: number; eps: number; weightDecay: number; clip: number;
+  /** Steps taken (for bias correction). */
+  readonly t: number;
   step(): void;
+  /** Free the moment buffers (the parameters belong to the network). */
+  destroy(): void;
 }
 export class Population {
+  /** count must be even: agents come in antithetic pairs (θ + σε, θ − σε). */
   constructor(ctx: Context, o: { layers: number[]; count: number; sigma?: number; lr?: number; act?: Activation; out?: Activation; seed?: number });
   readonly count: number;
+  /** The shared parameter vector. */
+  readonly theta: GArray;
+  sigma: number;
+  lr: number;
+  destroy(): void;
   readonly parameterCount: number;
   readonly generation: number;
   /** Every agent's network on its own observation row: X [count × in] → Y [count × out]. */
@@ -656,22 +1113,36 @@ export namespace nn {
   export const GEMM_CONFIGS: GemmConfig[];
   export function gemmKernel(ctx: Context, cfg: GemmConfig, o?: { transA?: boolean; transB?: boolean; act?: Activation; bias?: boolean; accumulate?: boolean; split?: boolean }): Kernel;
   export class Dense {
-    constructor(ctx: Context, inF: number, outF: number, o?: { act?: Activation; init?: string; seed?: number; first?: boolean; omega?: number });
-    readonly in: number; readonly out: number; readonly W: GArray; readonly b: GArray; readonly params: Param[];
+    constructor(ctx: Context, inF: number, outF: number, o?: { act?: Activation; init?: 'he' | 'xavier' | 'siren'; seed?: number; first?: boolean; omega?: number });
+    readonly in: number; readonly out: number; readonly act: Activation;
+    readonly W: GArray; readonly b: GArray; readonly gW: GArray; readonly gb: GArray; readonly params: Param[];
+    /** Re-initialise the weights (uniform He / Xavier / SIREN with ω₀ folded in) and zero the biases. */
+    init(kind: 'he' | 'xavier' | 'siren', seed: number, first?: boolean, omega?: number): void;
+    destroy(): void;
   }
-  export class FourierFeatures { constructor(ctx: Context, inF: number, bands?: number); readonly out: number; forward(X: GArray, Y: GArray, batch: number): GArray }
+  export class FourierFeatures {
+    constructor(ctx: Context, inF: number, bands?: number);
+    readonly in: number; readonly bands: number; readonly out: number;
+    forward(X: GArray, Y: GArray, batch: number): GArray;
+    destroy(): void;
+  }
   export class MSELoss {
     constructor(ctx: Context, maxElems: number);
-    /** Records the loss and returns dLoss/dY. */
+    /** dLoss/dY of the last run. */
+    readonly grad: GArray;
+    /** Records the loss and returns dLoss/dY (count ≤ maxElems). */
     run(Y: GArray, T: GArray, count: number): GArray;
     readLoss(): Promise<number>;
+    destroy(): void;
   }
-  export class SGD { constructor(ctx: Context, params: Param[], o?: { lr?: number; momentum?: number }); lr: number; step(): void }
+  export class SGD { constructor(ctx: Context, params: Param[], o?: { lr?: number; momentum?: number }); lr: number; momentum: number; step(): void; destroy(): void }
 }
 
 // ---------------------------------------------------------------------------------- networking
 
-export interface Channel { send(message: unknown): void; onmessage: ((message: any) => void) | null }
+export interface Channel { send(message: unknown): void; onmessage: ((message: any) => void) | null; close(): void }
+/** Anything that relays signalling messages between peers (see BroadcastSignaler, WebSocketSignaler). */
+export interface Signaler { send(payload: unknown, to?: string): void | Promise<void>; onmessage: ((message: { from: string; to?: string; payload: any }) => void) | null; close?(): void }
 export interface ChannelPair { unreliable: Channel; reliable: Channel }
 
 export interface Transcript {
@@ -690,7 +1161,10 @@ export interface RollbackSim {
   snapshot(into?: any): any;
   restore(s: any): void;
   step(dt: number): void;
-  hashRecord(target: GArray, snap: any): void;
+  hashRecord(target: GArray, snap: any): unknown;
+  /** Needed for resync (the authority exports, the others import); RigidWorld has both. */
+  exportState?(snap?: any): Promise<unknown>;
+  importState?(state: any): void;
 }
 
 export interface RollbackOptions {
@@ -728,6 +1202,7 @@ export namespace net {
     constructor(o?: { latency?: number; jitter?: number; loss?: number; duplicate?: number; seed?: number; codec?: boolean });
     latency: number; jitter: number; loss: number; duplicate: number;
     readonly stats: { sent: number; delivered: number; dropped: number; bytes: number };
+    /** Two connected endpoints; channel.close() stops its deliveries. */
     connect(): [ChannelPair, ChannelPair];
   }
   /** Wrap an RTCDataChannel (or anything with send(), onmessage, readyState) as a Channel with the wire encoding and chunking. */
@@ -736,13 +1211,19 @@ export namespace net {
   export function encode(message: unknown): string;
   export function decode(text: string): any;
   /** Signalling between tabs of one browser. */
-  export class BroadcastSignaler { constructor(room: string); send(payload: unknown, to?: string): void; close(): void }
+  export class BroadcastSignaler implements Signaler { constructor(room: string); readonly id: string; onmessage: Signaler['onmessage']; send(payload: unknown, to?: string): void; close(): void }
   /** Signalling through a relay that forwards { room, from, to, payload } JSON messages. */
-  export class WebSocketSignaler { constructor(url: string, room: string); send(payload: unknown, to?: string): Promise<void>; close(): void }
+  export class WebSocketSignaler implements Signaler {
+    constructor(url: string, room: string);
+    readonly id: string; readonly ready: Promise<void>; onmessage: Signaler['onmessage'];
+    send(payload: unknown, to?: string): Promise<void>; close(): void;
+  }
   /** A WebRTC peer with an unreliable (unordered, no retransmits) and a reliable data channel. */
   export class RTCPeer {
     constructor(signaler: BroadcastSignaler | WebSocketSignaler, o?: { initiator?: boolean; iceServers?: unknown[] });
-    readonly ready: Promise<void>;
+    /** Resolves (with the peer) when both channels are open; rejects if the connection fails or is closed first. */
+    readonly ready: Promise<RTCPeer>;
+    readonly pc: RTCPeerConnection;
     readonly channels: ChannelPair;
     close(): void;
   }
@@ -753,7 +1234,7 @@ export namespace net {
     /** Ticks ≤ this have every player's input (final). */
     readonly confirmedTick: number;
     readonly chain: string;
-    readonly hashes: Map<number, { local?: string; remote?: string }>;
+    readonly hashes: Map<number, { local?: string; remote?: string; reported?: boolean }>;
     readonly stats: { rollbacks: number; rolledBackTicks: number; stalls: number; desyncs: number; resyncs: number; statesSent: number; statesReceived: number;
       exportErrors: number; gpuWaits: number; hashesRecorded: number; hashesDropped: number; hashesStale: number; ping: number; inSyncTick: number;
       sent: number; received: number; [diagnostic: string]: unknown };
@@ -766,7 +1247,7 @@ export namespace net {
     transcript(): Transcript;
   }
   /** Re-execute a transcript and check every state hash and the chain head. */
-  export function verifyTranscript(tr: Transcript, makeSim: () => RigidWorld | Promise<RigidWorld>, applyInputs: (sim: RigidWorld, tick: number, inputs: Uint8Array[]) => void):
+  export function verifyTranscript<S extends { step(dt: number): void; hash(): Promise<string> }>(tr: Transcript, makeSim: () => S | Promise<S>, applyInputs: (sim: S, tick: number, inputs: Uint8Array[]) => void):
     Promise<{ ok: boolean; ticks: number; checkedHashes: number; chain?: string; firstMismatch: unknown }>;
   export function chainHash(prev: string, ...parts: Array<number | string | ArrayLike<number>>): string;
 }
@@ -781,16 +1262,17 @@ export namespace verify {
   export function checkSorted(ctx: Context, keys: GArray, n: number): Promise<Verdict>;
   export function checkPermutation(ctx: Context, a: GArray, b: GArray, n: number): Promise<Verdict>;
   /** Freivalds' certificate for C = op(A) op(B); false accept ≤ 2^-trials. */
-  export function freivalds(ctx: Context, A: GArray, B: GArray, C: GArray, o: { M: number; N: number; K: number; transA?: boolean; transB?: boolean; trials?: number; tol?: number }): Promise<Verdict & { maxRelative: number; trials: number; falseAcceptBound: number }>;
+  /** Fresh random vectors on every call (pass seed for reproducible vectors, which forfeits the bound against adversarial inputs). */
+  export function freivalds(ctx: Context, A: GArray, B: GArray, C: GArray, o: { M: number; N: number; K: number; transA?: boolean; transB?: boolean; trials?: number; tol?: number; seed?: number }): Promise<Verdict & { maxRelative: number; trials: number; falseAcceptBound: number }>;
   export function checkColoring(world: RigidWorld): Promise<Verdict>;
   export function checkContacts(world: RigidWorld, o?: { maxPenetration?: number; coneTol?: number }): Promise<Verdict>;
   export function checkMPM(sim: MPM, tol?: number): Promise<Verdict>;
-  export function checkGradient(net: MLP, X: GArray, T: GArray, batch: number, o?: Record<string, unknown>): Promise<Verdict>;
+  export function checkGradient(net: MLP, X: GArray, T: GArray, batch: number, o?: { samples?: number; eps?: number; tol?: number; seed?: number }): Promise<Verdict>;
   export function checkDeterminism(makeWorld: () => RigidWorld | Promise<RigidWorld>, steps?: number, every?: number): Promise<Verdict>;
   export function checkReplay(world: RigidWorld, steps?: number): Promise<Verdict>;
   /** The executable specification (LAWS.md). */
   export const LAWS: Law[];
-  export function proveAll(gpu: Context, SI: unknown, only?: string[]): Promise<Array<{ name: string; statement: string; ok: boolean; evidence: Verdict }>>;
+  export function proveAll(gpu: Context, SI: unknown, only?: string[]): Promise<Array<{ name: string; statement: string; ok: boolean; ms: number; evidence: Verdict }>>;
 }
 
 // ---------------------------------------------------------------------------------- three.js interop
@@ -800,12 +1282,16 @@ export namespace three {
   export function renderer(THREE: any, gpu: Context, opts?: Record<string, unknown>): Promise<any>;
   /** The GPUBuffer behind a three.js storage attribute. */
   export function bufferOf(renderer: any, attribute: any): GPUBufferT;
-  /** Instanced meshes of every rigid body, posed by a kernel straight from GPU memory each frame. */
-  export function bodies(o: { THREE: any; TSL: any; renderer: any; world: RigidWorld; material?: (shape: number) => any; castShadow?: boolean; receiveShadow?: boolean; colors?: unknown; groups?: number }):
-    { object: any; meshes: any[]; attribute: any; update(): void };
-  /** Point sprites from any GArray of positions. */
-  export function particles(o: { THREE: any; TSL: any; renderer: any; source: GArray; stride?: number; count: () => number; max: number; [k: string]: unknown }):
-    { object: any; attribute: any; update(): void };
+  /**
+   * Instanced meshes of every rigid body, posed by a kernel straight from GPU memory each frame.
+   * Call update() after world.step(), then gpu.flush(), then render.
+   */
+  export function bodies(o: { THREE: any; TSL: any; renderer: any; world: RigidWorld; material?: (shape: 'box' | 'sphere' | 'capsule') => any; castShadow?: boolean; receiveShadow?: boolean; colors?: (instance: any) => any; groups?: number }):
+    { object: any; meshes: { box: any; sphere: any; capsule: any }; attribute: any; update(): void; dispose(): void };
+  /** Instanced particles from any GArray of vec4 positions (or a function returning the current one). */
+  export function particles(o: { THREE: any; TSL: any; renderer: any; source: GArray | (() => GArray); gpu?: Context; stride?: number; count?: number | (() => number); max?: number;
+    scale?: number; offset?: number[]; radius?: number; color?: number[] | unknown; material?: any }):
+    { object: any; attribute: any; update(): void; dispose(): void };
 }
 
 // only the names marked `export` above are part of the API

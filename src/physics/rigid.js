@@ -36,11 +36,13 @@
 import { SpatialGrid } from '../prims/grid.js';
 import { Scan } from '../prims/scan.js';
 import { BODY_VEC4, CONTACT_VEC4, JOINT_VEC4, SHAPES, FLAGS, JOINT_TYPES, JOINT_FLAGS, NARROW_WGSL, RAY_WGSL } from './rigid-wgsl.js';
+import { SIError } from '../core/errors.js';
+import { destroyAll } from '../core/dispose.js';
 
 export { SHAPES as RIGID_SHAPES, FLAGS as RIGID_FLAGS, JOINT_TYPES, JOINT_FLAGS };
 
 const MAX_COLORS = 16;
-const COLOR_ROUNDS = 20;
+export const COLOR_ROUNDS = 20;   // Jones–Plassmann rounds per step (the verify checker reads the final buffer)
 const MAX_LARGE = 256;    // bodies too big for the broadphase grid, tested against everything
 const LANES = 8;          // threads per body in the primal step
 const BODIES_PER_WG = 64 / LANES;
@@ -56,6 +58,8 @@ const reverseList = (NB, b) => /* wgsl */`
   let rn = min(rw & 0xffffu, select(${MAXR}u, ${MAXRL}u, rw > 0xffffu));
   let rb = select(${b} * ${MAXR}u, ${NB * (MAXR + 1)}u + ((rw >> 16u) - 1u) * ${MAXRL}u, rw > 0xffffu);`;
 const NONE = 0xffffffff;
+const STORAGE_BUFFERS_NEEDED = 10;       // rigid-reverse-large binds 10
+const FUSED_WORKGROUP_BYTES = 128 * 9 * 16 + 4;   // the fused solve's reduction array (128 lanes × 9 vec4f) + a counter
 const CMD = { pose: 1, velocity: 2, impulse: 3, flags: 4, filter: 5, kinematic: 6, motor: 7, jointFlags: 8, limits: 9, props: 10 };
 
 // Reads only the members of a body a constraint needs (spliced into kernels that bind B).
@@ -79,6 +83,11 @@ export class RigidWorld {
    */
   constructor(ctx, o = {}) {
     this.ctx = ctx;
+    // the solver binds up to 10 storage buffers in one kernel (the WebGPU default limit is 8; init()
+    // requests the adapter's maximum, which is 10 or more on ~98% of devices)
+    const sb = ctx.limits.maxStorageBuffersPerShaderStage;
+    if (sb < STORAGE_BUFFERS_NEEDED)
+      throw new SIError(`RigidWorld needs ${STORAGE_BUFFERS_NEEDED} storage buffers per shader stage; this device allows ${sb}`, 'unsupported');
     this.maxBodies = Math.min(o.maxBodies || 16384, 65535);
     this.maxContacts = o.maxContacts || this.maxBodies * 16;
     this.maxPairs = o.maxPairs || this.maxBodies * 8;
@@ -221,8 +230,9 @@ export class RigidWorld {
     return id;
   }
 
-  /** Remove a body (its slot is reused by later adds; joints attached to it are disabled). */
+  /** Remove a body (its slot is reused by later adds; joints attached to it are disabled). Removing twice is a no-op. */
   remove(id) {
+    if (!(id >= 0 && id < this.count) || this.free.includes(id)) return;
     this._cmd(CMD.flags, id, null, null, 0, FLAGS.disabled);
     this.free.push(id);
     this.joints.forEach((j, k) => { if (j.a === id || j.b === id) this.setJointEnabled(k, false); });
@@ -230,6 +240,11 @@ export class RigidWorld {
 
   // ------------------------------------------------------------------ commands (applied in order, on the GPU)
   _cmd(type, id, a, c, hz = 0, hw = 0) {
+    // an invalid id would be clamped by the GPU onto another body or joint: refuse it here
+    const joint = type >= CMD.motor && type <= CMD.limits;
+    const n = joint ? this.joints.length : this.count;
+    if (!Number.isInteger(id) || id < 0 || id >= n)
+      throw new SIError(`RigidWorld: no ${joint ? 'joint' : 'body'} ${id} (${n} exist${id === -1 ? '; -1 is what add* returns when the world is full' : ''})`, 'invalid-argument');
     this.cmds.push({ type, id, a: a || [0, 0, 0, 0], c: c || [0, 0, 0, 0], hz, hw });
   }
   /** Teleport a body. */
@@ -269,8 +284,11 @@ export class RigidWorld {
     const k = this.joints.length;
     if (k >= this.maxJoints) return -1;
     const type = JOINT_TYPES[o.type || 'ball'];
-    if (type === undefined) throw new Error(`RigidWorld: unknown joint type ${o.type}`);
+    if (type === undefined) throw new SIError(`RigidWorld.addJoint: unknown joint type "${o.type}" (use ${Object.keys(JOINT_TYPES).join(' | ')})`, 'invalid-argument');
     const a = o.a, b = o.b === undefined || o.b === null || o.b < 0 ? NONE : o.b;
+    const valid = (id) => Number.isInteger(id) && id >= 0 && id < this.count && !this.free.includes(id);
+    if (!valid(a) || (b !== NONE && !valid(b)))
+      throw new SIError(`RigidWorld.addJoint: body ${valid(a) ? b : a} does not exist`, 'invalid-argument');
     const pa = this.cpu[a] ? [...this.cpu[a].subarray(0, 3)] : [0, 0, 0];
     const anchor = o.anchor || (b === NONE ? pa : [...this.cpu[b].subarray(0, 3)]);
     const anchorB = o.anchorB || anchor;
@@ -290,14 +308,26 @@ export class RigidWorld {
     rec.set([axis[0] / al, axis[1] / al, axis[2] / al, o.limits ? o.limits[0] : 0], 16);
     rec.set([axis[0] / al, axis[1] / al, axis[2] / al, o.limits ? o.limits[1] : 0], 20);
     rec.set([o.stiffness ?? 0, o.damping ?? 0, o.motor?.speed ?? 0, o.motor?.maxForce ?? 0], 24);
-    this.joints.push({ a, b, type, flags, rec, enabled: true });
+    this.joints.push({ a, b, type, flags, rec, enabled: true, motorMax: o.motor?.maxForce ?? 0 });
     this.jointsDirty = true;
     this._pending = true;
     return k;
   }
-  /** Motor target speed (rad/s or m/s) and force/torque limit; speed null turns the motor off. */
-  setMotor(j, speed, maxForce) { this._cmd(CMD.motor, j, [speed ?? 0, maxForce ?? 0, speed === null ? 0 : 1, 0]); }
-  setLimits(j, lo, hi) { this._cmd(CMD.limits, j, [lo ?? 0, hi ?? 0, lo === null ? 0 : 1, 0]); }
+  /**
+   * Motor target speed (rad/s or m/s) and force/torque limit (default: the joint's current limit);
+   * speed null turns the motor off.
+   */
+  setMotor(j, speed, maxForce) {
+    const jt = this.joints[j];
+    if (jt && maxForce !== undefined) jt.motorMax = maxForce;
+    this._cmd(CMD.motor, j, [speed ?? 0, maxForce ?? jt?.motorMax ?? 0, speed === null ? 0 : 1, 0]);
+  }
+  /** Limits [lo, hi] (rad or m); setLimits(j, null) removes them. */
+  setLimits(j, lo, hi) {
+    if (lo !== null && !(Number.isFinite(lo) && Number.isFinite(hi) && lo <= hi))
+      throw new SIError(`RigidWorld.setLimits: need lo ≤ hi (got ${lo}, ${hi}); pass null to remove the limits`, 'invalid-argument');
+    this._cmd(CMD.limits, j, [lo ?? 0, hi ?? 0, lo === null ? 0 : 1, 0]);
+  }
   setJointEnabled(j, on) {
     this._cmd(CMD.jointFlags, j, null, null, on ? JOINT_FLAGS.disabled : 0, on ? 0 : JOINT_FLAGS.disabled);
     if (this.joints[j]) this.joints[j].enabled = on;
@@ -366,6 +396,7 @@ export class RigidWorld {
     const volume = (hi[0] - lo[0]) * (hi[1] - lo[1]) * (hi[2] - lo[2]);
     const cell = Math.max(0.05, 2 * this.rSmall + this.margin, 1.01 * Math.cbrt(volume / (1 << 22)));
     if (!this.grid || Math.abs(this.grid.cellSize - cell) > 1e-6) {
+      this.grid?.destroy();   // its last uses were submitted by the flush above
       this.grid = new SpatialGrid(this.ctx, { maxCount: this.maxBodies, min: this.bounds[0], max: this.bounds[1], cellSize: cell });
       this._gridKernels();
     }
@@ -660,8 +691,11 @@ export class RigidWorld {
        for (var gi = i; gi < counter[3]; gi += nwg.x * nwg.y * WG) {
         let i = gi;   // the pair this iteration writes (grid-stride: any dispatch size covers all pairs)
         let base = coffset[i];
-        let n = coffset[i + 1u] - base;
-        if (n == 0u || base + n > u.maxContacts) { continue; }
+        let nAll = coffset[i + 1u] - base;
+        if (nAll == 0u || base >= u.maxContacts) { continue; }
+        // a pair straddling maxContacts keeps the points that fit: readers stop at maxContacts, so
+        // skipping it would leave stale contacts from an earlier step in the slots they still read
+        let n = min(nAll, u.maxContacts - base);
         let pr = pairs[i];
         let a = pr.x; let b = pr.y;
         let A = B[a];
@@ -1273,6 +1307,8 @@ export class RigidWorld {
 
   // ------------------------------------------------------------------ stepping
   step(frameDt = 1 / 60) {
+    if (this.destroyed) throw new SIError('RigidWorld.step: the world was destroyed');
+    if (!(frameDt > 0)) return;   // a zero or invalid time step would divide by zero on the GPU
     this.commit();
     if (!this.count) { this.cmds = []; return; }
     const ctx = this.ctx, n = this.count;
@@ -1291,10 +1327,11 @@ export class RigidWorld {
       maxPairs: this.maxPairs,
     };
     const gridBufs = { B: this.B, order: this.grid.order, start: this.grid.start, large: this.large, jset: this.jset, J: this.J };
+    ctx.clear(this.cnts);   // once per step: the event counter accumulates over the substeps (the other slots are rewritten each substep)
     for (let s = 0; s < this.substeps; s++) {
       const cur = this.frame & 1, prev = cur ^ 1;
       ctx.region('rigid: broadphase', () => {
-        ctx.clear(this.cnts); ctx.clear(this.tbl[cur]); ctx.clear(this.ccount);
+        ctx.clear(this.tbl[cur]); ctx.clear(this.ccount);
         this.predictK.run(n, { dt, g: this.gravity }, { B: this.B, centers: this.centers, ext: this.ext });
         if (nj) this.jointPrepK.run(nj, { gammaLam, gammaK: this.gamma, kStart: this.kStartJoint, ih2, massFloor: this.jointMassFloor }, { B: this.B, J: this.J });
         this.grid.build(this.centers, n);
@@ -1401,7 +1438,7 @@ export class RigidWorld {
   _useFused(n) {
     const on = this.fusedSolve;
     if (on === false) return false;
-    if (this.ctx.limits.maxStorageBuffersPerShaderStage < 9) return false;
+    if (this.ctx.limits.maxComputeWorkgroupStorageSize < FUSED_WORKGROUP_BYTES) return false;   // ~1% of devices (16 KB)
     return on === true || n <= on;
   }
 
@@ -1420,6 +1457,7 @@ export class RigidWorld {
 
   /** Body poses: Float32Array of [x, y, z, qx, qy, qz, qw] per body. */
   async readPoses() {
+    if (!this.count) return new Float32Array(0);
     const raw = await this.B.read(this.count * BODY_VEC4);
     const out = new Float32Array(this.count * 7);
     for (let k = 0; k < this.count; k++) {
@@ -1431,6 +1469,8 @@ export class RigidWorld {
 
   /** Full body state: { position, rotation, velocity, angularVelocity, flags } typed arrays. */
   async readBodies() {
+    if (!this.count) return { position: new Float32Array(0), rotation: new Float32Array(0), velocity: new Float32Array(0),
+      angularVelocity: new Float32Array(0), flags: new Uint32Array(0) };
     const raw = await this.B.read(this.count * BODY_VEC4);
     const u = new Uint32Array(raw.buffer, raw.byteOffset, raw.length);
     const n = this.count;
@@ -1485,7 +1525,8 @@ export class RigidWorld {
 
   /** Cast rays [{ origin, dir, maxDistance, mask }] → [{ hit, body, distance, point, normal }]. */
   async raycast(rays) {
-    if (!this._rq || this._rq.maxRays < rays.length) this._rq = new RayQuery(this, Math.max(64, rays.length));
+    if (!rays.length) return [];
+    if (!this._rq || this._rq.maxRays < rays.length) { this._rq?.destroy(); this._rq = new RayQuery(this, Math.max(64, rays.length)); }
     this._rq.set(rays).run(rays.length);
     return this._rq.read(rays.length);
   }
@@ -1640,6 +1681,18 @@ export class RigidWorld {
     if (s.cnt) ctx.copy(s.cnt, this.cnts, 32);   // so an export right after this describes the restored contacts
     this._pending = true;   // re-derive the large-body list for the restored set of bodies
   }
+
+  /** Free every GPU buffer the world allocated (snapshots you took are yours to destroy). Idempotent. */
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.count = 0; this.uploaded = 0;   // anything still pointing at this world (renderers, couplings, ray queries) sees it empty
+    destroyAll(this.B, this.ext, this.centers, this.pcount, this.poffset, this.pairs, this.pscratch, this.rlist, this.ccount, this.coffset,
+      this.C, this.tbl, this.J, this.jcsr, this.jset, this.large, this.color, this.clist, this.info, this.args, this.cnts, this.cmdBuf,
+      this.eventBuf, this.hashBuf, this.pairScan, this.contactScan, this.grid, this._rq);
+    this.grid = null; this._rq = null;
+    this.cpu = []; this.cmds = []; this.forceFields = [];
+  }
 }
 
 /**
@@ -1705,7 +1758,9 @@ export class RayQuery {
   /** Record the query for `count` rays (rays may have been written by GPU kernels). */
   run(count = this.maxRays) {
     const w = this.world, ctx = w.ctx;
-    if (!w.count || !count) return this;
+    if (this.destroyed) throw new SIError('RayQuery.run: it was destroyed');
+    if (!count) return this;
+    if (!w.count) { ctx.fillFloat(this.hits, -1); return this; }   // nothing to hit: every ray misses
     ctx.fill(this.best, 0xffffffff);
     const bufs = { B: w.B, rays: this.rays, best: this.best };
     this.testK.run([w.count, count], { phase: 0 }, bufs);
@@ -1713,8 +1768,11 @@ export class RayQuery {
     this.resolveK.run(count, { phase: 0 }, { ...bufs, hits: this.hits });
     return this;
   }
+  destroy() { this.destroyed = true; destroyAll(this.rays, this.hits, this.best); }
+
   /** Read hits: [{ hit, body, distance, normal, point }]. */
   async read(count = this.maxRays) {
+    if (!count) return [];
     const h = await this.hits.read(count * 2);
     const r = await this.rays.read(count * 2);
     const u = new Uint32Array(h.buffer, h.byteOffset, h.length);

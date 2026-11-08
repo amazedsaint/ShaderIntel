@@ -19,6 +19,7 @@ import { coreTests, gpuTests } from './core.test.js';
 import { shaderTests } from './shaders.test.js';
 import { physicsTests } from './physics.test.js';
 import { systemsTests } from './systems.test.js';
+import { lifecycleTests } from './lifecycle.test.js';
 
 const params = new URLSearchParams(location.search);
 const only = params.get('only');
@@ -30,6 +31,7 @@ try {
   if (!only || only === 'shaders') await shaderTests(gpu);
   if (!only || only === 'physics') await physicsTests(gpu);
   if (!only || only === 'systems') await systemsTests(gpu);
+  if (!only || only === 'lifecycle') await lifecycleTests(gpu);
   if (!only || only === 'portable') {
     const portable = await SI.init({ subgroups: false });
     await gpuTests(portable, 'portable');

@@ -16,6 +16,8 @@
 //      shadow, ambient occlusion and PBR shading; writes depth so rasterised
 //      layers (particles, meshes) intersect the SDF scene correctly.
 import { RenderProgram } from './program.js';
+import { destroyAll } from '../core/dispose.js';
+import { SIError } from '../core/errors.js';
 
 const MATERIAL_WGSL = /* wgsl */`
 struct Material { albedo: vec3f, roughness: f32, metallic: f32, emissive: vec3f }
@@ -108,7 +110,25 @@ export class SdfScene {
     this.tw = 0; this.th = 0;
   }
 
-  set(values) { Object.assign(this.values, values); return this; }
+  /**
+   * Update values: your uniforms, plus shadows, ao (booleans), maxDistance, sun, sunRadiance, fog.
+   * Unknown names throw here rather than in the middle of a frame.
+   */
+  set(values) {
+    const v = { ...values };
+    if ('maxDistance' in v) { v.maxDist = v.maxDistance; delete v.maxDistance; }
+    if ('shadows' in v) v.shadows = +v.shadows;
+    if ('ao' in v) v.ao = +v.ao;
+    if (v.sun) v.sun = norm(v.sun);
+    if ('tile' in v) {
+      if (v.tile !== this.tile) throw new SIError('SdfScene.set: the tile size is fixed when the scene is created', 'invalid-argument');
+      delete v.tile;
+    }
+    for (const k of Object.keys(v))
+      if (!this.program.fieldByName.has(k)) throw new SIError(`SdfScene.set: unknown value "${k}" (declare it in uniforms)`, 'invalid-argument');
+    Object.assign(this.values, v);
+    return this;
+  }
 
   prepare(view) {
     const T = this.tile;
@@ -128,6 +148,7 @@ export class SdfScene {
   draw(pass, view) {
     this.program.draw(pass, view, 3, 1, { ...this.values, tilesX: this.tw, time: view.time }, { tsafe: this.tsafe });
   }
+  destroy() { this.destroyed = true; destroyAll(this.tsafe); this.tsafe = null; this.tw = this.th = 0; }
 }
 
 function norm(v) { const l = Math.hypot(...v) || 1; return v.map((x) => x / l); }

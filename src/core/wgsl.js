@@ -7,6 +7,7 @@
 //     resolve to a subgroup-accelerated or a portable body.
 // WGSL allows module-scope declarations in any order, so no topological sort
 // of the bodies is needed — only de-duplication.
+import { SIError } from './errors.js';
 
 const registry = new Map();
 
@@ -58,7 +59,7 @@ export function link(userCode, imports = [], caps = {}) {
   const visit = (name, from) => {
     if (seen.has(name)) return;
     const mod = registry.get(name);
-    if (!mod) throw new Error(`ShaderIntel: unknown WGSL module "${name}"${from ? ` (imported by ${from})` : ''}. Known: ${moduleNames().join(', ')}`);
+    if (!mod) throw new SIError(`ShaderIntel: unknown WGSL module "${name}"${from ? ` (imported by ${from})` : ''}. Known: ${moduleNames().join(', ')}`);
     seen.add(name);
     for (const d of mod.deps) visit(d, name);
     order.push(mod);
@@ -84,7 +85,7 @@ export function literal(value, type = 'f32') {
   if (typeof value === 'boolean') return value ? 'true' : 'false';
   if (type === 'u32') return `${Math.max(0, Math.round(value)) >>> 0}u`;
   if (type === 'i32') return `${Math.round(value) | 0}i`;
-  if (!Number.isFinite(value)) throw new Error(`ShaderIntel: non-finite WGSL literal ${value}`);
+  if (!Number.isFinite(value)) throw new SIError(`ShaderIntel: non-finite WGSL literal ${value}`);
   const s = String(value);
   return /[.eE]/.test(s) ? s : s + '.0';
 }

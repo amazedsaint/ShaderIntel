@@ -53,5 +53,7 @@ export class Points {
   set(v) { this.program.set(v); return this; }
   bind(r) { this.program.bind(r); return this; }
   get count() { const c = this.o.count; return typeof c === 'function' ? c() : c ?? this.o.data.length; }
-  draw(pass, view) { const n = this.count; if (n > 0) this.program.draw(pass, view, 4, n); }
+  draw(pass, view) { if (this.o.data?.destroyed) return; const n = this.count; if (n > 0) this.program.draw(pass, view, 4, n); }
+  /** Layers own no GPU memory beyond their pipeline (garbage-collected); kept for a uniform API. */
+  destroy() { this.destroyed = true; }
 }

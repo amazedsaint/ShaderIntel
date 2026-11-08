@@ -6,6 +6,8 @@
 // contiguous in sorted order: a 27-cell neighbourhood is visited as 9 ranges.
 import { defineModule } from '../core/wgsl.js';
 import { Scan } from './scan.js';
+import { destroyAll } from '../core/dispose.js';
+import { SIError } from '../core/errors.js';
 
 defineModule('grid', {
   doc: 'Uniform grid helpers (cell coordinate / linear index).',
@@ -55,6 +57,8 @@ export class SpatialGrid {
     this.gathers = new Map();
   }
 
+  destroy() { destroyAll(this.cell, this.rank, this.order, this.start, this.scan); }
+
   /** Uniform declarations a kernel needs to evaluate grid cells. */
   uniforms() { return { gridOrigin: 'vec3f', gridInv: 'f32', gridDims: 'vec3u', gridCells: 'u32' }; }
 
@@ -65,6 +69,7 @@ export class SpatialGrid {
 
   /** Sort `count` particles (pos: vec4f array) into cells. Fills order/start. */
   build(pos, count) {
+    if (count > this.maxCount) throw new SIError(`SpatialGrid.build: ${count} points exceed maxCount = ${this.maxCount}`, 'invalid-argument');
     this.count = count;
     this.ctx.clear(this.start);
     this.countK.run(count, this.values(), { pos, cell: this.cell, rank: this.rank, count: this.start });

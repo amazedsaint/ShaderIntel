@@ -45,5 +45,10 @@ export class Glyphs {
   }
   set(v) { this.program.set(v); return this; }
   get count() { const c = this.o.count; return typeof c === 'function' ? c() : c ?? this.o.pos.length; }
-  draw(pass, view) { this.program.draw(pass, view, 12, this.count, null, { P: this.o.pos, V: this.o.vel }); }
+  draw(pass, view) {
+    if (this.o.pos.destroyed || this.o.vel.destroyed) return;
+    this.program.draw(pass, view, 12, this.count, null, { P: this.o.pos, V: this.o.vel });
+  }
+  /** Layers own no GPU memory beyond their pipeline (garbage-collected); kept for a uniform API. */
+  destroy() { this.destroyed = true; }
 }

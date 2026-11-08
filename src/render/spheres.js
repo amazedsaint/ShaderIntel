@@ -90,9 +90,12 @@ export class Spheres {
   set(v) { Object.assign(this.values, v); this.program.set(v); return this; }
   get count() { const c = this.o.count; return typeof c === 'function' ? c() : c ?? this.o.data.length; }
   draw(pass, view) {
+    if (this.o.data?.destroyed) return;
     const n = this.count;
     if (n > 0) this.program.draw(pass, view, 4, n);
   }
+  /** Layers own no GPU memory beyond their pipeline (garbage-collected); kept for a uniform API. */
+  destroy() { this.destroyed = true; }
 }
 
 function normalize3(v) { const l = Math.hypot(...v) || 1; return v.map((x) => x / l); }

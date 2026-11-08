@@ -123,8 +123,16 @@ try {
       return r.result.value;
     };
     await S('Page.navigate', { url: pageUrl });
+    // a page that throws (a module that fails to load, a syntax error) before the condition holds
+    // fails the run after a short grace period instead of waiting for the full timeout
     const until = async (expr, every = 500) => {
-      while (Date.now() - t0 < timeout) { if (await evaluate(expr).catch(() => false)) return true; await sleep(every); }
+      let firstError = 0;
+      while (Date.now() - t0 < timeout) {
+        if (await evaluate(expr).catch(() => false)) return true;
+        if (errors.length && !firstError) firstError = Date.now();
+        if (firstError && Date.now() - firstError > 5000) throw new Error(`the page failed before ${expr}: ${String(errors[0]).split('\n')[0]}`);
+        await sleep(every);
+      }
       throw new Error(`timed out after ${timeout / 1000} s waiting for ${expr}`);
     };
     return { S, evaluate, until, errors };

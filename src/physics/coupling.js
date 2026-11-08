@@ -21,6 +21,7 @@
 // p' dx⁴/Δt_s in world units.
 import { defineModule } from '../core/wgsl.js';
 import './rigid-wgsl.js';
+import { destroyAll } from '../core/dispose.js';
 
 const MAX_CAND = 128;
 const FPJ = 16384;   // fixed-point scale of lattice momentum
@@ -65,7 +66,7 @@ export class FluidRigidCoupling {
   /**
    * @param sim   MPM solver
    * @param world RigidWorld
-   * o: friction (fluid–body, default 0.2), band (cells, default 1.5), mask (collision group bits of
+   * o: friction (fluid–body, default 0.2), band (cells, default 0.5), mask (collision group bits of
    *    bodies that interact, default all), densityScale (rigid mass per MPM density unit per m³, default 1)
    */
   constructor(ctx, sim, world, o = {}) {
@@ -192,8 +193,15 @@ export class FluidRigidCoupling {
     this.tiles = dims.map((d) => Math.ceil(d / 4));
   }
 
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    destroyAll(this.acc);
+  }
+
   /** Called by MPM after the grid update of substep s. */
   substep(s) {
+    if (this.destroyed || this.world.destroyed || this.sim.destroyed) return;
     const w = this.world, sim = this.sim;
     if (!this.enabled || !w.count) return;
     const dts = sim.substepDt;
@@ -205,6 +213,7 @@ export class FluidRigidCoupling {
 
   /** Called by MPM after its frame: hand the accumulated impulses to the rigid world. */
   finish() {
+    if (this.destroyed || this.world.destroyed || this.sim.destroyed) return;
     const w = this.world, sim = this.sim;
     if (!this.enabled || !w.count) return;
     const dx = sim.dx;

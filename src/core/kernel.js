@@ -18,6 +18,7 @@
 // These names are reserved: declaring a local called e.g. `nsg` in `code` clashes.
 import { structLayout, writeField, layoutOf, roundUp } from './types.js';
 import { link, constants } from './wgsl.js';
+import { SIError } from './errors.js';
 
 const USES_SUBGROUPS = /\bsgi\b|\bsgs\b|\bsgid\b|\bnsg\b|\bsubgroup[A-Z]\w*\s*\(|\bquad[A-Z]\w*\s*\(/;
 const USES_SGID = /\bsgid\b|\bnsg\b/;
@@ -59,7 +60,7 @@ export class Kernel {
     const shared = desc.shared || '';
     const usesSG = USES_SUBGROUPS.test(body) || USES_SUBGROUPS.test(shared) || desc.subgroups;
     if (usesSG && !caps.subgroups)
-      throw new Error(`ShaderIntel: kernel "${this.name}" uses subgroup operations but this device lacks the "subgroups" feature`);
+      throw new SIError(`ShaderIntel: kernel "${this.name}" uses subgroup operations but this device lacks the "subgroups" feature`);
     const usesSgid = usesSG && USES_SGID.test(body);
     const nativeSgid = usesSgid && caps.subgroupId;
 
@@ -100,7 +101,8 @@ export class Kernel {
       body,
       '}',
     ].join('\n');
-    this.code = link(src, desc.imports || [], caps);
+    // subgroups: false makes capability-dependent modules (e.g. wgscan) emit their portable code
+    this.code = link(src, desc.imports || [], desc.subgroups === false ? { ...caps, subgroups: false } : caps);
 
     // Binding contracts: the element stride of every storage binding, from the linked WGSL
     // (structs included), so bind() can reject a buffer that is not a whole number of elements.
@@ -124,7 +126,7 @@ export class Kernel {
     if (!values) return this;
     for (const [k, v] of Object.entries(values)) {
       const f = this.fieldByName.get(k);
-      if (!f) throw new Error(`ShaderIntel: kernel "${this.name}" has no uniform "${k}"`);
+      if (!f) throw new SIError(`ShaderIntel: kernel "${this.name}" has no uniform "${k}"`);
       writeField(this.uview, f, v);
     }
     return this;
@@ -134,7 +136,7 @@ export class Kernel {
   bind(resources) {
     if (!resources) return this;
     for (const [k, v] of Object.entries(resources)) {
-      if (!this.slotByName.has(k)) throw new Error(`ShaderIntel: kernel "${this.name}" has no binding "${k}"`);
+      if (!this.slotByName.has(k)) throw new SIError(`ShaderIntel: kernel "${this.name}" has no binding "${k}"`);
       if (this.bound[k] !== v) checkContract(this, this.slots[this.slotByName.get(k)], v);
       this.bound[k] = v;
     }
@@ -199,7 +201,7 @@ export class Kernel {
     let key = ring.gen + '';
     for (const s of this.slots) {
       const r = this.bound[s.name];
-      if (!r) throw new Error(`ShaderIntel: kernel "${this.name}": binding "${s.name}" was never provided`);
+      if (!r) throw new SIError(`ShaderIntel: kernel "${this.name}": binding "${s.name}" was never provided`);
       key += ':' + resourceId(r);
     }
     let bg = this.bgCache.get(key);
@@ -272,7 +274,7 @@ function checkContract(kernel, slot, r) {
   const bytes = r.byteLength ?? r.size ?? r.buffer?.size;
   if (typeof bytes !== 'number') return;
   if (bytes % slot.stride !== 0)
-    throw new Error(`ShaderIntel: kernel "${kernel.name}", binding "${slot.name}": a buffer of ${bytes} bytes is not a whole ` +
+    throw new SIError(`ShaderIntel: kernel "${kernel.name}", binding "${slot.name}": a buffer of ${bytes} bytes is not a whole ` +
       `number of ${slot.type} (stride ${slot.stride} bytes) — the CPU-side record size and the WGSL type disagree`);
 }
 
@@ -292,7 +294,7 @@ function bufferSlot(name, spec) {
         decl: `var<uniform> ${name}: ${type};`, layout: { buffer: { type: 'uniform' } } };
     }
   }
-  if (access === 'read' && atomic) throw new Error(`ShaderIntel: atomic binding "${name}" must be read_write`);
+  if (access === 'read' && atomic) throw new SIError(`ShaderIntel: atomic binding "${name}" must be read_write`);
   const elem = atomic ? `atomic<${type}>` : type;
   const ro = access === 'read';
   return {

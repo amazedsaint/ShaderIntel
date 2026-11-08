@@ -4,7 +4,7 @@
 //   const gpu = await SI.init();
 //
 // Everything is plain ES modules with zero dependencies.
-export { init, Context, SIError } from './core/context.js';
+export { init, isSupported, Context, SIError } from './core/context.js';
 export { GArray } from './core/buffer.js';
 export { Kernel } from './core/kernel.js';
 export { defineModule, link, moduleNames, moduleInfo, literal } from './core/wgsl.js';
@@ -20,7 +20,7 @@ export { Spheres } from './render/spheres.js';
 export { m4, v3 } from './render/math.js';
 export { Stage, Lines } from './render/scene.js';
 export { panel } from './ui.js';
-export { MPM, MATERIALS } from './physics/mpm.js';
+export { MPM, MATERIALS, MPM_KINDS } from './physics/mpm.js';
 export { NBody, timeIt } from './physics/nbody.js';
 export { Points } from './render/points.js';
 export { Bloom } from './render/bloom.js';

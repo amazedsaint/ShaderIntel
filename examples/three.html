@@ -23,10 +23,16 @@
 </div>
 <script src="common.js"></script>
 <script type="module">
-import * as THREE from 'three/webgpu';
-import * as TSL from 'three/tsl';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import * as SI from '../src/index.js';
+
+// three.js comes from a CDN (the library itself has no dependencies): load it so a network
+// failure is reported on the page instead of leaving it blank
+let THREE, TSL, OrbitControls;
+try {
+  [THREE, TSL, { OrbitControls }] = await Promise.all([import('three/webgpu'), import('three/tsl'), import('three/addons/controls/OrbitControls.js')]);
+} catch (e) {
+  throw new Error(`three.js could not be loaded from cdn.jsdelivr.net (${e.message}).\nThis example needs network access; every other example runs offline.`);
+}
 
 const gpu = await SI.init();
 const canvas = document.getElementById('c');
@@ -78,9 +84,13 @@ world.setVelocity(ball, [0, 0, -7]);
 const bodies = SI.three.bodies({ THREE, TSL, renderer, world });
 scene.add(bodies.object);
 
+// a click (not the end of an orbit drag) throws a ball where you point
 const ray = new THREE.Raycaster();
-canvas.addEventListener('pointerdown', (e) => {
-  if (e.button !== 0 || e.altKey) return;
+let press = null;
+canvas.addEventListener('pointerdown', (e) => { press = e.button === 0 && !e.altKey ? { x: e.clientX, y: e.clientY, t: performance.now() } : null; });
+canvas.addEventListener('pointerup', (e) => {
+  if (!press || Math.hypot(e.clientX - press.x, e.clientY - press.y) > 6 || performance.now() - press.t > 400) return;
+  press = null;
   ray.setFromCamera(new THREE.Vector2((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1), camera);
   const o = ray.ray.origin, d = ray.ray.direction;
   world.addSphere({ position: [o.x + d.x * 2, o.y + d.y * 2, o.z + d.z * 2], radius: 0.4, density: 4, velocity: [d.x * 30, d.y * 30, d.z * 30] });

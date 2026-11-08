@@ -1,11 +1,29 @@
-// ShaderIntel — WebGPU physics + shader library. Single-file build of src/ (50 modules).
+// ShaderIntel — WebGPU physics + shader library. Single-file build of src/ (52 modules).
 (function (global) {
 'use strict';
+// ---- src/core/errors.js
+const __m4 = (() => {
+// The error class for every failure ShaderIntel reports on purpose (no imports, so any module can use it).
+//   try { ... } catch (e) { if (e instanceof SI.SIError && e.code === 'unsupported') showFallback(); }
+// Codes: 'unsupported' (no WebGPU), 'no-adapter', 'no-device', 'compile' (WGSL errors),
+// 'invalid-argument', 'error' (anything else).
+class SIError extends Error {
+  constructor(msg, code = 'error') {
+    super(msg.startsWith('ShaderIntel') ? msg : `ShaderIntel: ${msg}`);
+    this.name = 'ShaderIntelError';
+    this.code = code;
+  }
+}
+return { SIError };
+})();
+
 // ---- src/core/types.js
 const __m3 = (() => {
+const SIError = __m4.SIError;
 // WGSL host-shareable type layout (WGSL spec §14.4 "Memory Layout").
 // Every size/alignment here is what the GPU expects, so JS can pack data
 // byte-exactly without guessing.
+
 
 const SCALARS = {
   f32: { size: 4, align: 4, array: Float32Array },
@@ -55,7 +73,7 @@ function layoutOf(type) {
       components: cols * rows, cols, rows, colStride, stride: cols * colStride,
     };
   }
-  throw new Error(`ShaderIntel: unsupported WGSL type "${type}"`);
+  throw new SIError(`ShaderIntel: unsupported WGSL type "${type}"`);
 }
 
 const roundUp = (x, a) => Math.ceil(x / a) * a;
@@ -148,9 +166,13 @@ return { canonical, layoutOf, roundUp, structLayout, writeField, toHalf, fromHal
 const __m2 = (() => {
 const layoutOf = __m3.layoutOf;
 const arrayCtor = __m3.arrayCtor;
+const SIError = __m4.SIError;
 // GArray: a typed GPU array. One storage buffer of `length` elements of a WGSL
 // type (f32, vec4f, u32, mat3x3f, ...) with upload / readback helpers.
 
+
+
+const err = (msg) => new SIError(msg, 'invalid-argument');
 
 let nextId = 1;
 
@@ -170,7 +192,8 @@ class GArray {
     this.label = opts.label || `${this.type}[]`;
     const data = typeof lengthOrData === 'number' ? null : lengthOrData;
     this.length = data ? Math.floor(data.length / this.layout.components) : lengthOrData;
-    if (!(this.length > 0)) throw new Error(`ShaderIntel: array length must be > 0 (got ${this.length})`);
+    if (!(this.length > 0) || !Number.isFinite(this.length)) throw err(`array length must be a positive number (got ${this.length})`);
+    this.length = Math.floor(this.length);
     this.byteLength = Math.max(16, Math.ceil((this.length * this.stride) / 16) * 16);
     const GU = GPUBufferUsage;
     this.usage = GU.STORAGE | GU.COPY_SRC | GU.COPY_DST | (opts.usage || 0);
@@ -207,9 +230,27 @@ class GArray {
           for (let k = 0; k < comps; k++) src[e * slots + k] = data[e * comps + k];
       }
     }
-    const bytes = Math.min(src.byteLength, this.byteLength - elementOffset * this.stride);
-    const aligned = bytes & ~3;
+    if (!(elementOffset >= 0) || elementOffset > this.length)
+      throw err(`${this.label}.write: element offset ${elementOffset} is outside the array (length ${this.length})`);
+    const room = this.byteLength - elementOffset * this.stride;
+    if (src.byteLength > room)
+      throw err(`${this.label}.write: ${src.byteLength} bytes at element ${elementOffset} do not fit (the array has room for ${room} bytes)`);
+    const aligned = src.byteLength & ~3;
     if (aligned > 0) this.ctx.device.queue.writeBuffer(this.buffer, elementOffset * this.stride, src.buffer, src.byteOffset, aligned);
+    return this;
+  }
+
+  /**
+   * Like write(), but ordered with recorded work (see Context.writeOrdered): dispatches recorded
+   * before see the old data, those after see the new. Use it between dispatches of one batch.
+   */
+  writeOrdered(data, elementOffset = 0) {
+    if (!(elementOffset >= 0) || elementOffset > this.length) throw err(`${this.label}.writeOrdered: element offset ${elementOffset} is outside the array`);
+    const Ctor = arrayCtor(this.type);
+    const src = this.slots === this.layout.components ? (data instanceof Ctor ? data : Ctor.from(data)) : null;
+    if (!src) return this.write(data, elementOffset);   // padded types: rare, keep the queue path
+    if (src.byteLength > this.byteLength - elementOffset * this.stride) throw err(`${this.label}.writeOrdered: the data does not fit`);
+    this.ctx.writeOrdered(this, src, elementOffset * this.stride);
     return this;
   }
 
@@ -238,13 +279,22 @@ class GArray {
     return out;
   }
 
-  destroy() { this.buffer.destroy(); }
+  /** Free the GPU memory now (idempotent); the array must not be used afterwards. */
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    // work recorded but not yet submitted may use this buffer; a destroyed buffer would make the
+    // whole submit fail (every other dispatch in it lost), so submit that work first
+    try { this.ctx.flush(); } catch { /* inside an open render pass: the buffer is destroyed after the frame */ }
+    this.buffer.destroy();
+  }
 }
 return { GArray };
 })();
 
 // ---- src/core/wgsl.js
-const __m5 = (() => {
+const __m6 = (() => {
+const SIError = __m4.SIError;
 // WGSL module system. WGSL has no #include, so ShaderIntel ships its shader
 // library as named modules that a tiny linker stitches together:
 //   - dependencies are resolved transitively and each module is emitted once;
@@ -254,6 +304,7 @@ const __m5 = (() => {
 //     resolve to a subgroup-accelerated or a portable body.
 // WGSL allows module-scope declarations in any order, so no topological sort
 // of the bodies is needed — only de-duplication.
+
 
 const registry = new Map();
 
@@ -305,7 +356,7 @@ function link(userCode, imports = [], caps = {}) {
   const visit = (name, from) => {
     if (seen.has(name)) return;
     const mod = registry.get(name);
-    if (!mod) throw new Error(`ShaderIntel: unknown WGSL module "${name}"${from ? ` (imported by ${from})` : ''}. Known: ${moduleNames().join(', ')}`);
+    if (!mod) throw new SIError(`ShaderIntel: unknown WGSL module "${name}"${from ? ` (imported by ${from})` : ''}. Known: ${moduleNames().join(', ')}`);
     seen.add(name);
     for (const d of mod.deps) visit(d, name);
     order.push(mod);
@@ -331,7 +382,7 @@ function literal(value, type = 'f32') {
   if (typeof value === 'boolean') return value ? 'true' : 'false';
   if (type === 'u32') return `${Math.max(0, Math.round(value)) >>> 0}u`;
   if (type === 'i32') return `${Math.round(value) | 0}i`;
-  if (!Number.isFinite(value)) throw new Error(`ShaderIntel: non-finite WGSL literal ${value}`);
+  if (!Number.isFinite(value)) throw new SIError(`ShaderIntel: non-finite WGSL literal ${value}`);
   const s = String(value);
   return /[.eE]/.test(s) ? s : s + '.0';
 }
@@ -349,13 +400,14 @@ return { defineModule, hasModule, moduleNames, moduleInfo, parseImports, link, l
 })();
 
 // ---- src/core/kernel.js
-const __m4 = (() => {
+const __m5 = (() => {
 const structLayout = __m3.structLayout;
 const writeField = __m3.writeField;
 const layoutOf = __m3.layoutOf;
 const roundUp = __m3.roundUp;
-const link = __m5.link;
-const constants = __m5.constants;
+const link = __m6.link;
+const constants = __m6.constants;
+const SIError = __m4.SIError;
 // Kernel: write only the body of a compute shader; ShaderIntel generates the
 // bindings, the uniform struct (with exact WGSL layout), the entry point, the
 // bounds guard and the dispatch geometry.
@@ -374,6 +426,7 @@ const constants = __m5.constants;
 //   gid, lid, lidx, wid, nwg, wgi (linear workgroup index)
 //   sgi, sgs (subgroup lane / size), sgid, nsg (subgroup index / count) when used.
 // These names are reserved: declaring a local called e.g. `nsg` in `code` clashes.
+
 
 
 
@@ -417,7 +470,7 @@ class Kernel {
     const shared = desc.shared || '';
     const usesSG = USES_SUBGROUPS.test(body) || USES_SUBGROUPS.test(shared) || desc.subgroups;
     if (usesSG && !caps.subgroups)
-      throw new Error(`ShaderIntel: kernel "${this.name}" uses subgroup operations but this device lacks the "subgroups" feature`);
+      throw new SIError(`ShaderIntel: kernel "${this.name}" uses subgroup operations but this device lacks the "subgroups" feature`);
     const usesSgid = usesSG && USES_SGID.test(body);
     const nativeSgid = usesSgid && caps.subgroupId;
 
@@ -458,7 +511,8 @@ class Kernel {
       body,
       '}',
     ].join('\n');
-    this.code = link(src, desc.imports || [], caps);
+    // subgroups: false makes capability-dependent modules (e.g. wgscan) emit their portable code
+    this.code = link(src, desc.imports || [], desc.subgroups === false ? { ...caps, subgroups: false } : caps);
 
     // Binding contracts: the element stride of every storage binding, from the linked WGSL
     // (structs included), so bind() can reject a buffer that is not a whole number of elements.
@@ -482,7 +536,7 @@ class Kernel {
     if (!values) return this;
     for (const [k, v] of Object.entries(values)) {
       const f = this.fieldByName.get(k);
-      if (!f) throw new Error(`ShaderIntel: kernel "${this.name}" has no uniform "${k}"`);
+      if (!f) throw new SIError(`ShaderIntel: kernel "${this.name}" has no uniform "${k}"`);
       writeField(this.uview, f, v);
     }
     return this;
@@ -492,7 +546,7 @@ class Kernel {
   bind(resources) {
     if (!resources) return this;
     for (const [k, v] of Object.entries(resources)) {
-      if (!this.slotByName.has(k)) throw new Error(`ShaderIntel: kernel "${this.name}" has no binding "${k}"`);
+      if (!this.slotByName.has(k)) throw new SIError(`ShaderIntel: kernel "${this.name}" has no binding "${k}"`);
       if (this.bound[k] !== v) checkContract(this, this.slots[this.slotByName.get(k)], v);
       this.bound[k] = v;
     }
@@ -557,7 +611,7 @@ class Kernel {
     let key = ring.gen + '';
     for (const s of this.slots) {
       const r = this.bound[s.name];
-      if (!r) throw new Error(`ShaderIntel: kernel "${this.name}": binding "${s.name}" was never provided`);
+      if (!r) throw new SIError(`ShaderIntel: kernel "${this.name}": binding "${s.name}" was never provided`);
       key += ':' + resourceId(r);
     }
     let bg = this.bgCache.get(key);
@@ -630,7 +684,7 @@ function checkContract(kernel, slot, r) {
   const bytes = r.byteLength ?? r.size ?? r.buffer?.size;
   if (typeof bytes !== 'number') return;
   if (bytes % slot.stride !== 0)
-    throw new Error(`ShaderIntel: kernel "${kernel.name}", binding "${slot.name}": a buffer of ${bytes} bytes is not a whole ` +
+    throw new SIError(`ShaderIntel: kernel "${kernel.name}", binding "${slot.name}": a buffer of ${bytes} bytes is not a whole ` +
       `number of ${slot.type} (stride ${slot.stride} bytes) — the CPU-side record size and the WGSL type disagree`);
 }
 
@@ -650,7 +704,7 @@ function bufferSlot(name, spec) {
         decl: `var<uniform> ${name}: ${type};`, layout: { buffer: { type: 'uniform' } } };
     }
   }
-  if (access === 'read' && atomic) throw new Error(`ShaderIntel: atomic binding "${name}" must be read_write`);
+  if (access === 'read' && atomic) throw new SIError(`ShaderIntel: atomic binding "${name}" must be read_write`);
   const elem = atomic ? `atomic<${type}>` : type;
   const ro = access === 'read';
   return {
@@ -717,7 +771,7 @@ return { Kernel };
 })();
 
 // ---- src/core/profiler.js
-const __m6 = (() => {
+const __m7 = (() => {
 // GPU profiler built on timestamp queries. A profiled region is exactly one
 // compute pass (timestamps can only be written at pass boundaries), so library
 // code clears buffers with compute kernels instead of clearBuffer inside
@@ -788,6 +842,14 @@ class Profiler {
   }
 
   reset() { this.results.clear(); }
+
+  destroy() {
+    if (!this.enabled) return;
+    this.enabled = false;
+    this.querySet.destroy();
+    this.resolveBuf.destroy();
+    for (const b of this.pool.splice(0)) b.destroy();
+  }
 }
 return { Profiler };
 })();
@@ -795,10 +857,11 @@ return { Profiler };
 // ---- src/core/context.js
 const __m1 = (() => {
 const GArray = __m2.GArray;
-const Kernel = __m4.Kernel;
-const Profiler = __m6.Profiler;
+const Kernel = __m5.Kernel;
+const Profiler = __m7.Profiler;
 const arrayCtor = __m3.arrayCtor;
 const roundUp = __m3.roundUp;
+const SIError = __m4.SIError;
 // Context: device acquisition, capability detection, command batching and the
 // uniform ring. Everything recorded through a Context (kernels, clears, copies,
 // render passes) goes into one command encoder; compute dispatches share a
@@ -808,9 +871,8 @@ const roundUp = __m3.roundUp;
 
 
 
-class SIError extends Error {
-  constructor(msg) { super(msg); this.name = 'ShaderIntelError'; }
-}
+
+
 
 const WANT_FEATURES = [
   'subgroups', 'shader-f16', 'timestamp-query', 'float32-filterable', 'float32-blendable',
@@ -832,10 +894,12 @@ const WANT_LIMITS = [
  * @returns {Promise<Context>}
  */
 async function init(opts = {}) {
-  if (typeof navigator === 'undefined' || !navigator.gpu)
-    throw new SIError('WebGPU is not available. Use Chrome/Edge 113+, Safari 26+ or Firefox 141+ (Windows), served from https:// or http://localhost.');
+  if (!isSupported())
+    throw new SIError('WebGPU is not available. Use Chrome/Edge 113+, Safari 26+ or Firefox 141+ (Windows), served from https:// or http://localhost.', 'unsupported');
+  // Share a device created elsewhere (three.js, another library): pass { device } (and its adapter if known).
+  if (opts.device) return new Context(opts.adapter || null, opts.device, opts);
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: opts.powerPreference || 'high-performance' });
-  if (!adapter) throw new SIError('No WebGPU adapter found (GPU blocklisted or disabled).');
+  if (!adapter) throw new SIError('No WebGPU adapter found (the GPU may be blocklisted or WebGPU disabled in this browser).', 'no-adapter');
   const disabled = new Set();
   if (opts.subgroups === false) disabled.add('subgroups');
   if (opts.f16 === false) disabled.add('shader-f16');
@@ -843,8 +907,18 @@ async function init(opts = {}) {
   const requiredFeatures = WANT_FEATURES.filter((f) => adapter.features.has(f) && !disabled.has(f));
   const requiredLimits = {};
   for (const k of WANT_LIMITS) if (k in adapter.limits) requiredLimits[k] = adapter.limits[k];
-  const device = await adapter.requestDevice({ requiredFeatures, requiredLimits, label: 'ShaderIntel' });
+  let device;
+  try {
+    device = await adapter.requestDevice({ requiredFeatures, requiredLimits, label: 'ShaderIntel' });
+  } catch (e) {
+    throw new SIError(`Could not create a WebGPU device: ${e?.message || e}`, 'no-device');
+  }
   return new Context(adapter, device, opts);
+}
+
+/** True when this environment exposes WebGPU (navigator.gpu); a GPU adapter may still be unavailable. */
+function isSupported() {
+  return typeof navigator !== 'undefined' && !!navigator.gpu;
 }
 
 class Context {
@@ -852,7 +926,9 @@ class Context {
     this.adapter = adapter;
     this.device = device;
     this.limits = device.limits;
-    const info = adapter.info || {};
+    this.destroyed = false;
+    this.ownsDevice = !opts.device;   // a shared device is left alive by destroy()
+    const info = adapter?.info || device.adapterInfo || {};
     const has = (f) => device.features.has(f);
     this.caps = {
       subgroups: has('subgroups'),
@@ -875,10 +951,16 @@ class Context {
     this._inRegion = false;
     this._pipelines = new Map();
     this._samplers = new Map();
+    this._texDead = new WeakSet();
     this._ring = new UniformRing(this);
     this.profiler = new Profiler(this);
-    this.lost = device.lost.then((i) => { console.error(`ShaderIntel: device lost (${i.reason}): ${i.message}`); return i; });
-    device.addEventListener?.('uncapturederror', (e) => console.error('ShaderIntel WebGPU error:', e.error?.message || e));
+    this.lost = device.lost.then((i) => {
+      this.destroyed = true;
+      if (i.reason !== 'destroyed') console.error(`ShaderIntel: device lost (${i.reason}): ${i.message}`);
+      return i;
+    });
+    this._onUncaptured = (e) => console.error('ShaderIntel WebGPU error:', e.error?.message || e);
+    device.addEventListener?.('uncapturederror', this._onUncaptured);
   }
 
   // ------------------------------------------------------------- resources
@@ -914,7 +996,7 @@ class Context {
       label: desc.label,
     });
     return { texture, view: texture.createView(), id: 't' + (++texId), width, height, depth, format: texture.format,
-      destroy() { texture.destroy(); } };
+      destroy: () => { if (this._texDead.has(texture)) return; this._texDead.add(texture); try { this.flush(); } catch { /* see GArray.destroy */ } texture.destroy(); } };
   }
 
   // ------------------------------------------------------------- recording
@@ -964,6 +1046,7 @@ class Context {
 
   /** Submit everything recorded so far. */
   flush() {
+    if (this.destroyed) { this._enc = null; this._pass = null; return; }
     this.endPass();
     const q = this.device.queue;
     this._ring.upload(q);
@@ -971,6 +1054,7 @@ class Context {
     const collect = this.profiler.resolve(this._enc);
     q.submit([this._enc.finish()]);
     this._enc = null;
+    if (this._staging) { for (const b of this._staging) b.destroy(); this._staging = null; }   // freed after the GPU is done with them
     this.stats.submits++;
     if (collect) collect();
   }
@@ -999,6 +1083,27 @@ class Context {
 
   fillFloat(arr, x) { f32tmp[0] = x; return this.fill(arr, u32tmp[0]); }
 
+  /**
+   * Write `data` into `dst` (a GArray or GPUBuffer) at `byteOffset`, ordered with the recorded work:
+   * unlike queue.writeBuffer (which lands before everything not yet submitted), dispatches recorded
+   * before this call see the old contents and those recorded after it see the new ones. For small,
+   * frequent uploads (colliders, sources, parameters) between dispatches of one batch.
+   */
+  writeOrdered(dst, data, byteOffset = 0) {
+    const src = ArrayBuffer.isView(data) ? data : new Float32Array(data);
+    const bytes = src.byteLength & ~3;
+    if (!bytes) return this;
+    const target = dst.buffer instanceof GPUBuffer ? dst.buffer : dst;
+    if (byteOffset + bytes > target.size) throw new SIError(`writeOrdered: ${bytes} bytes at ${byteOffset} do not fit in ${target.size}`, 'invalid-argument');
+    const staging = this.device.createBuffer({ size: bytes, usage: GPUBufferUsage.COPY_SRC, mappedAtCreation: true });
+    new Uint8Array(staging.getMappedRange()).set(new Uint8Array(src.buffer, src.byteOffset, bytes));
+    staging.unmap();
+    this.endPass();
+    this.encoder.copyBufferToBuffer(staging, 0, target, byteOffset, bytes);
+    (this._staging ||= []).push(staging);   // destroyed once the batch is submitted
+    return this;
+  }
+
   /** Copy `bytes` (default: all) between arrays/buffers. */
   copy(src, dst, bytes, srcOffset = 0, dstOffset = 0) {
     const s = src.buffer instanceof GPUBuffer ? src.buffer : src;
@@ -1013,7 +1118,9 @@ class Context {
   async read(arr, count = arr.length) {
     const stride = arr.stride ?? 4;
     const total = arr.byteLength ?? arr.size;
-    const bytes = Math.min(total, roundUp(count * stride, 4));
+    const bytes = Math.min(total, roundUp(Math.max(0, count) * stride, 4));
+    const Ctor0 = arr.type ? arrayCtor(arr.type) : Uint32Array;
+    if (bytes === 0) return new Ctor0(0);
     const staging = this.device.createBuffer({ size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     this.endPass();
     this.encoder.copyBufferToBuffer(arr.buffer instanceof GPUBuffer ? arr.buffer : arr, 0, staging, 0, bytes);
@@ -1063,7 +1170,11 @@ class Context {
   // ------------------------------------------------------------- shaders
   /** Create a shader module and a promise that rejects with readable errors. */
   shaderModule(code, label = 'shader') {
+    // Parse errors would also surface as an uncaptured validation error; catch that copy here,
+    // so a bad shader is reported once, formatted with its source lines (below).
+    this.device.pushErrorScope('validation');
     const module = this.device.createShaderModule({ code, label });
+    this.device.popErrorScope().catch(() => {});
     const ready = module.getCompilationInfo().then((info) => {
       const errors = info.messages.filter((m) => m.type === 'error');
       const warnings = info.messages.filter((m) => m.type === 'warning');
@@ -1071,7 +1182,7 @@ class Context {
       if (errors.length) {
         const msg = formatMessages(label, code, errors);
         console.error(msg);
-        throw new SIError(msg);
+        throw new SIError(msg, 'compile');
       }
     });
     ready.catch(() => {});
@@ -1096,8 +1207,11 @@ class Context {
       layout: d.createPipelineLayout({ bindGroupLayouts: [bgl] }),
       compute: { module, entryPoint: 'main' },
     });
-    const scope = d.popErrorScope().then((err) => {
-      if (err) { const m = `ShaderIntel: pipeline "${name}": ${err.message}`; console.error(m); throw new SIError(m); }
+    const scope = d.popErrorScope().then(async (err) => {
+      if (!err) return;
+      const m = `ShaderIntel: pipeline "${name}": ${err.message}`;
+      if (await ready.then(() => true, () => false)) console.error(m);   // else the WGSL errors were reported already
+      throw new SIError(m);
     });
     c = { pipeline, bgl, module, ready: Promise.all([ready, scope]).then(() => true) };
     c.ready.catch(() => {});
@@ -1105,9 +1219,17 @@ class Context {
     return c;
   }
 
+  /**
+   * Submit pending work and release the device (and with it every buffer, texture and pipeline
+   * made on it). A device passed in with init({ device }) is not destroyed, only detached from.
+   */
   destroy() {
-    this.flush();
-    this.device.destroy();
+    if (this.destroyed) return;
+    try { this.flush(); } catch { /* the device may be lost already */ }
+    this.destroyed = true;
+    this.device.removeEventListener?.('uncapturederror', this._onUncaptured);
+    if (this.ownsDevice) this.device.destroy();
+    else { this._ring.destroy(); this.profiler.destroy(); this._gemmTmp?.destroy(); }
   }
 }
 
@@ -1122,43 +1244,66 @@ let texId = 0;
 const f32tmp = new Float32Array(1);
 const u32tmp = new Uint32Array(f32tmp.buffer);
 
-/** Per-batch ring of 256-byte uniform slots addressed with dynamic offsets. */
+/**
+ * Per-batch ring of 256-byte uniform slots addressed with dynamic offsets. When a batch needs
+ * more than one segment (1 MB), another segment is opened instead of flushing: a flush is
+ * impossible while a render pass is being recorded. Bind groups name their segment (gen).
+ */
 class UniformRing {
   constructor(ctx, size = 1 << 20) {
     this.ctx = ctx;
     this.size = size;
-    this.staging = new ArrayBuffer(size);
-    this.u32 = new Uint32Array(this.staging);
-    this.buffer = ctx.device.createBuffer({ size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: 'si-uniform-ring' });
-    this.used = 0;
-    this.batch = 0;
-    this.gen = 0;
     this.align = Math.max(256, ctx.limits.minUniformBufferOffsetAlignment);
+    this.segments = [];
+    this.seg = -1;
+    this.batch = 0;
+    this._open();
+  }
+
+  _open() {
+    this.seg++;
+    if (!this.segments[this.seg]) {
+      const staging = new ArrayBuffer(this.size);
+      this.segments.push({ staging, u32: new Uint32Array(staging), used: 0,
+        buffer: this.ctx.device.createBuffer({ size: this.size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: `si-uniform-ring-${this.seg}` }) });
+    }
+    const s = this.segments[this.seg];
+    s.used = 0;
+    this.buffer = s.buffer; this.u32 = s.u32; this.gen = this.seg; this.used = 0;
   }
 
   /** Copy the kernel's uniform bytes into a slot; identical consecutive data reuses its slot. */
   push(kernel) {
     const src = kernel.u32;
-    if (kernel._ringBatch === this.batch) {
+    if (kernel._ringBatch === this.batch && kernel._ringSeg === this.seg) {
       const base = kernel._ringOff >>> 2;
       let same = true;
       for (let k = 0; k < src.length; k++) if (this.u32[base + k] !== src[k]) { same = false; break; }
       if (same) return kernel._ringOff;
     }
-    if (this.used + kernel.U.size > this.size) this.ctx.flush();
+    if (this.used + kernel.U.size > this.size) { this.segments[this.seg].used = this.used; this._open(); }
     const off = this.used;
     this.u32.set(src, off >>> 2);
     this.used = roundUp(off + kernel.U.size, this.align);
     kernel._ringBatch = this.batch;
+    kernel._ringSeg = this.seg;
     kernel._ringOff = off;
     return off;
   }
 
   upload(queue) {
-    if (this.used) queue.writeBuffer(this.buffer, 0, this.staging, 0, this.used);
-    this.used = 0;
+    this.segments[this.seg].used = this.used;
+    for (let k = 0; k <= this.seg; k++) {
+      const s = this.segments[k];
+      if (s.used) queue.writeBuffer(s.buffer, 0, s.staging, 0, s.used);
+      s.used = 0;
+    }
+    this.seg = -1;
+    this._open();
     this.batch++;
   }
+
+  destroy() { for (const s of this.segments) s.buffer.destroy(); }
 }
 
 function formatMessages(label, code, messages) {
@@ -1171,12 +1316,29 @@ function formatMessages(label, code, messages) {
   }
   return out.join('\n');
 }
-return { SIError, init, Context };
+return { SIError, init, isSupported, Context };
+})();
+
+// ---- src/core/dispose.js
+const __m9 = (() => {
+// destroyAll(a, b, [c, d], obj): destroy GPU resources and owned helper objects in one call.
+// Accepts GArrays, texture handles, GPUBuffers / GPUTextures, anything with destroy(), arrays of
+// those and null / undefined (skipped). Every destroy() in ShaderIntel is idempotent.
+function destroyAll(...list) {
+  for (const r of list.flat(4)) {
+    if (r && typeof r.destroy === 'function') {
+      try { r.destroy(); } catch (e) { console.warn('ShaderIntel: destroy failed', e); }
+    }
+  }
+}
+return { destroyAll };
 })();
 
 // ---- src/prims/scan.js
-const __m7 = (() => {
-const defineModule = __m5.defineModule;
+const __m8 = (() => {
+const defineModule = __m6.defineModule;
+const destroyAll = __m9.destroyAll;
+const SIError = __m4.SIError;
 // Exclusive prefix sum (u32) over 4096-element tiles (256 threads x 16 values).
 //
 // Default: reduce-then-scan (reduce tiles -> scan partials recursively ->
@@ -1197,6 +1359,8 @@ const defineModule = __m5.defineModule;
 // Without subgroups a Hillis–Steele scan in workgroup memory is used instead.
 // Workgroup size keeps (#subgroups <= subgroup size) for every size the adapter
 // can produce.
+
+
 
 
 /** WGSL module 'wgscan': workgroup-wide exclusive scan / reduction of one u32 per thread. */
@@ -1265,9 +1429,11 @@ class Scan {
    */
   constructor(ctx, maxN, o = {}) {
     this.ctx = ctx;
-    const sg = ctx.caps.subgroups;
+    // The workgroup scan has every subgroup scan the subgroup totals, so it needs
+    // workgroup / subgroupSize ≤ subgroupSize for the smallest subgroup size the device may use.
     const minSG = ctx.caps.subgroupMin || 32;
-    this.wg = sg ? Math.max(32, Math.min(256, minSG * minSG)) : 256;
+    const sg = ctx.caps.subgroups && minSG >= 8;
+    this.wg = sg ? Math.min(256, minSG * minSG) : 256;
     this.items = ctx.caps.workgroupStorage >= 20480 ? 16 : 8;
     this.tile = this.wg * this.items;
     this.maxN = maxN;
@@ -1457,12 +1623,15 @@ class Scan {
     }
   }
 
+  /** Free the scan's scratch buffers. */
+  destroy() { destroyAll(this.levels, this.dummy, this.status); this.levels = []; }
+
   /**
    * Exclusive scan of the first n u32 of `src` into `dst` (may alias).
    * Elements past n inside the last vec4 are overwritten in dst.
    */
   run(src, dst = src, n = src.length) {
-    if (n > this.maxN) throw new Error(`Scan: n=${n} exceeds maxN=${this.maxN}`);
+    if (n > this.maxN) throw new SIError(`Scan.run: n = ${n} exceeds maxN = ${this.maxN}`, 'invalid-argument');
     const tiles = Math.ceil(n / this.tile);
     if (tiles <= 1) return this._down(1, n, 0, src, dst, this.dummy), dst;
     // In place, a fallback could read a predecessor's tile after its outputs overwrote it:
@@ -1495,11 +1664,15 @@ return { Scan };
 })();
 
 // ---- src/prims/reduce.js
-const __m8 = (() => {
+const __m10 = (() => {
+const destroyAll = __m9.destroyAll;
+const SIError = __m4.SIError;
 // Parallel reduction (sum / min / max) with an optional per-element map,
 // e.g. max speed of a particle set: new Reduce(ctx, { input: 'vec4f', type: 'f32',
 // op: 'max', map: 'length(x.xyz)' }). The result stays on the GPU (result[0]) so
 // other kernels can consume it without a CPU round trip; read() fetches it.
+
+
 
 const IDENT = {
   sum: { f32: '0.0', u32: '0u', i32: '0i' },
@@ -1525,7 +1698,8 @@ class Reduce {
     const vecN = /vec([234])/.exec(type)?.[1];
     const ident = vecN ? `${type}(${IDENT[op][scalar]})` : IDENT[op][scalar];
     const combine = op === 'sum' ? 'a + b' : `${op}(a, b)`;
-    const sg = ctx.caps.subgroups;
+    // the two-level subgroup reduction needs 256 / subgroupSize ≤ subgroupSize, i.e. subgroups of 16+
+    const sg = ctx.caps.subgroups && (ctx.caps.subgroupMin || 32) >= 16;
     this.wg = 256;
     this.tile = this.wg * ITEMS;
     this.type = type;
@@ -1570,9 +1744,14 @@ class Reduce {
     this.restK = input === type && !o.map ? this.firstK : make(type, 'x', 'reduce-rest');
   }
 
-  /** Reduce the first n elements of src. Returns the 1-element result array (on GPU). */
+  /** Free the reduction's buffers. */
+  destroy() { destroyAll(this.result, this.levels); this.levels = []; }
+
+  /** Reduce the first n elements of src (n = 0 gives the identity). Returns the 1-element result array (on GPU). */
   run(src, n = src.length) {
-    let groups = Math.ceil(n / this.tile);
+    n = Math.max(0, n | 0);
+    if (n > this.maxN) throw new SIError(`Reduce.run: n = ${n} exceeds maxN = ${this.maxN} (pass a larger maxN to the constructor)`, 'invalid-argument');
+    let groups = Math.max(1, Math.ceil(n / this.tile));
     let k = this.firstK, level = 0, cur = src, count = n;
     for (;;) {
       const dst = groups === 1 ? this.result : this.levels[level];
@@ -1595,15 +1774,19 @@ return { Reduce };
 })();
 
 // ---- src/prims/grid.js
-const __m9 = (() => {
-const defineModule = __m5.defineModule;
-const Scan = __m7.Scan;
+const __m11 = (() => {
+const defineModule = __m6.defineModule;
+const Scan = __m8.Scan;
+const destroyAll = __m9.destroyAll;
+const SIError = __m4.SIError;
 // Uniform-grid neighbour search by counting sort — O(N), three dispatches + a scan:
 //   count:   cell[i] = cellOf(p_i); rank[i] = atomicAdd(&count[cell], 1)
 //   scan:    start = exclusiveScan(count)      (numCells + 1 entries)
 //   scatter: order[start[cell[i]] + rank[i]] = i
 // Cells are linearised x-fastest, so the three cells of a row (x-1..x+1) are
 // contiguous in sorted order: a 27-cell neighbourhood is visited as 9 ranges.
+
+
 
 
 
@@ -1655,6 +1838,8 @@ class SpatialGrid {
     this.gathers = new Map();
   }
 
+  destroy() { destroyAll(this.cell, this.rank, this.order, this.start, this.scan); }
+
   /** Uniform declarations a kernel needs to evaluate grid cells. */
   uniforms() { return { gridOrigin: 'vec3f', gridInv: 'f32', gridDims: 'vec3u', gridCells: 'u32' }; }
 
@@ -1665,6 +1850,7 @@ class SpatialGrid {
 
   /** Sort `count` particles (pos: vec4f array) into cells. Fills order/start. */
   build(pos, count) {
+    if (count > this.maxCount) throw new SIError(`SpatialGrid.build: ${count} points exceed maxCount = ${this.maxCount}`, 'invalid-argument');
     this.count = count;
     this.ctx.clear(this.start);
     this.countK.run(count, this.values(), { pos, cell: this.cell, rank: this.rank, count: this.start });
@@ -1715,16 +1901,18 @@ return { SpatialGrid };
 })();
 
 // ---- src/render/program.js
-const __m11 = (() => {
+const __m13 = (() => {
 const structLayout = __m3.structLayout;
 const writeField = __m3.writeField;
-const link = __m5.link;
-const constants = __m5.constants;
+const link = __m6.link;
+const constants = __m6.constants;
+const SIError = __m4.SIError;
 // RenderProgram: the render-pipeline twin of Kernel. Write @vertex/@fragment
 // functions; bindings, the camera block and the uniform struct are generated.
 //   binding 0  cam: Camera   (from the View)
 //   binding 1  u:   Params   (uniform ring, dynamic offset)
 //   binding 2+ buffers (read-only storage), textures, samplers in declaration order
+
 
 
 
@@ -1815,8 +2003,11 @@ class RenderProgram {
       primitive: { topology: desc.topology || 'triangle-list', cullMode: desc.cullMode || 'none' },
       depthStencil: depth,
     });
-    const scope = d.popErrorScope().then((err) => {
-      if (err) { const m = `ShaderIntel: render pipeline "${this.name}": ${err.message}`; console.error(m); throw new Error(m); }
+    const scope = d.popErrorScope().then(async (err) => {
+      if (!err) return;
+      const m = `ShaderIntel: render pipeline "${this.name}": ${err.message}`;
+      if (await ready.then(() => true, () => false)) console.error(m);   // else the WGSL errors were reported already
+      throw new SIError(m);
     });
     this._ready = Promise.all([ready, scope]);
     this._ready.catch(() => {});
@@ -1831,7 +2022,7 @@ class RenderProgram {
     if (!values) return this;
     for (const [k, v] of Object.entries(values)) {
       const f = this.fieldByName.get(k);
-      if (!f) throw new Error(`ShaderIntel: program "${this.name}" has no uniform "${k}"`);
+      if (!f) throw new SIError(`ShaderIntel: program "${this.name}" has no uniform "${k}"`);
       writeField(this.uview, f, v);
     }
     return this;
@@ -1861,7 +2052,7 @@ class RenderProgram {
     const off = this.ctx._ring.push(this);
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, this._bindGroup(view), [off]);
-    pass.setIndexBuffer(indexBuffer, 'uint32');
+    pass.setIndexBuffer(indexBuffer instanceof GPUBuffer ? indexBuffer : indexBuffer.buffer, 'uint32');   // a GPUBuffer or a GArray
     pass.drawIndexed(indexCount, instanceCount);
     return this;
   }
@@ -1871,7 +2062,7 @@ class RenderProgram {
     let key = `${ring.gen}:${view.id}`;
     for (const s of this.slots) {
       const r = this.bound[s.name];
-      if (!r) throw new Error(`ShaderIntel: program "${this.name}": binding "${s.name}" not provided`);
+      if (!r) throw new SIError(`ShaderIntel: program "${this.name}": binding "${s.name}" not provided`);
       key += ':' + (r.id || (r.__sampler ? r.filter + r.wrap : idOf(r)));
     }
     let bg = this.bgCache.get(key);
@@ -1903,16 +2094,18 @@ return { CAMERA_WGSL, CAMERA_SIZE, RenderProgram };
 })();
 
 // ---- src/render/bloom.js
-const __m12 = (() => {
+const __m14 = (() => {
+const destroyAll = __m9.destroyAll;
 // Energy-conserving HDR bloom (progressive downsample / tent upsample, after
 // Jimenez, "Next Generation Post Processing in Call of Duty: AW", 2014).
 // No threshold: every pixel contributes a little, so bright HDR values glow
 // naturally and the image stays physically plausible.
+
 class Bloom {
   constructor(ctx, o = {}) {
     this.ctx = ctx;
     this.strength = o.strength ?? 0.05;
-    this.levels = o.levels ?? 6;
+    this.levels = Math.max(1, Math.round(o.levels ?? 6));
     this.radius = o.radius ?? 1;
     this.down = [];
     this.up = [];
@@ -1939,7 +2132,12 @@ class Bloom {
         let l = textureSampleLevel(src, lin, uv + t * vec2f(-1.0, -1.0), 0.0).rgb;
         let m = textureSampleLevel(src, lin, uv + t * vec2f(1.0, -1.0), 0.0).rgb;
         var o = e * 0.125 + (a + c + g + ii) * 0.03125 + (b + d + f + h) * 0.0625 + (j + k + l + m) * 0.125;
-        if (u.firstLevel == 1u) { o = min(o, vec3f(64.0)); } // tame fireflies before they spread
+        if (u.firstLevel == 1u) {
+          // a NaN or infinity in the scene would spread over the whole chain: drop it (integer test,
+          // which no compiler may fold away), then tame fireflies before they spread
+          let bits = bitcast<vec3u>(o) & vec3u(0x7fffffffu);
+          o = min(select(o, vec3f(0.0), bits >= vec3u(0x7f800000u)), vec3f(64.0));
+        }
         textureStore(dst, vec2i(p.xy), vec4f(max(o, vec3f(0.0)), 1.0));`,
     });
     this.upK = ctx.kernel({
@@ -1994,12 +2192,13 @@ class Bloom {
     }
     return n > 1 ? this.up[0] : this.down[0];
   }
+  destroy() { this.destroyed = true; destroyAll(this.down, this.up); this.down = []; this.up = []; }
 }
 return { Bloom };
 })();
 
 // ---- src/render/math.js
-const __m13 = (() => {
+const __m15 = (() => {
 // Minimal column-major mat4 / vec3 helpers (WebGPU clip space: z in [0, 1]).
 
 const v3 = {
@@ -2084,12 +2283,13 @@ return { v3, m4 };
 })();
 
 // ---- src/render/view.js
-const __m10 = (() => {
-const RenderProgram = __m11.RenderProgram;
-const CAMERA_SIZE = __m11.CAMERA_SIZE;
-const Bloom = __m12.Bloom;
-const m4 = __m13.m4;
-const v3 = __m13.v3;
+const __m12 = (() => {
+const RenderProgram = __m13.RenderProgram;
+const CAMERA_SIZE = __m13.CAMERA_SIZE;
+const Bloom = __m14.Bloom;
+const m4 = __m15.m4;
+const v3 = __m15.v3;
+const SIError = __m4.SIError;
 // View: canvas + HDR scene target + orbit camera + frame loop + tonemapping.
 //
 //   const view = gpu.view('#canvas', { camera: { target: [0, 0.3, 0], distance: 2 } });
@@ -2099,7 +2299,15 @@ const v3 = __m13.v3;
 // Layers may implement:
 //   prepare(view)          record compute / off-screen passes before the scene pass
 //   draw(pass, view)       draw into the HDR scene pass (rgba16float + depth32float)
+//   afterScene(view)       screen-space effects that read the scene (water, volumes)
 //   overlay(pass, view)    draw after tonemapping, straight into the canvas (UI, debug)
+//   resize(view)           the drawing buffer changed size
+//   attach(view) / detach(view)   added to / removed from a view
+//
+// view.destroy() stops the loop, removes every listener and observer, unconfigures the
+// canvas and frees the view's own GPU textures; destroy({ layers: true }) also destroys
+// the layers that are still attached.
+
 
 
 
@@ -2107,34 +2315,47 @@ const v3 = __m13.v3;
 let viewId = 0;
 const HDR_FORMAT = 'rgba16float';
 const DEPTH_FORMAT = 'depth32float';
+const TONEMAPS = { agx: 0, aces: 1, neutral: 2, reinhard: 3, none: 4 };
 
 class View {
   constructor(ctx, canvas, opts = {}) {
     this.ctx = ctx;
     this.id = 'v' + ++viewId;
     this.canvas = typeof canvas === 'string' ? document.querySelector(canvas) : canvas;
-    if (!this.canvas) throw new Error('ShaderIntel: canvas not found');
+    if (!this.canvas) throw new SIError(`View: canvas ${typeof canvas === 'string' ? `"${canvas}" ` : ''}not found`);
     this.context = this.canvas.getContext('webgpu');
+    if (!this.context) throw new SIError('View: the canvas has no WebGPU context (is it already used by WebGL or a 2D context?)');
     this.context.configure({ device: ctx.device, format: ctx.format, alphaMode: 'opaque' });
     this.layers = [];
     this.background = opts.background || [0.02, 0.025, 0.03, 1];
     this.exposure = opts.exposure ?? 1;
     this.tonemap = opts.tonemap || 'agx';
-    this.pixelRatio = opts.pixelRatio || Math.min(2, window.devicePixelRatio || 1);
+    if (!(this.tonemap in TONEMAPS)) throw new SIError(`View: unknown tonemap "${this.tonemap}" (use ${Object.keys(TONEMAPS).join(' | ')})`);
+    this._dprAuto = !opts.pixelRatio;
+    this.pixelRatio = opts.pixelRatio || Math.min(opts.maxPixelRatio ?? 2, window.devicePixelRatio || 1);
+    this.maxPixelRatio = opts.maxPixelRatio ?? 2;
+    this.onError = opts.onError || null;
+    /** Called before every frame with { dt, time, frame, view } (set by run(fn), or directly). */
+    this.onFrame = null;
     this.time = 0;
     this.frame = 0;
     this.dt = 1 / 60;
+    this.destroyed = false;
+    this._off = [];        // listener removers, run by destroy()
+    this._raf = 0;
+    this._stopped = true;
     this.cameraBuffer = ctx.device.createBuffer({ size: CAMERA_SIZE, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: 'camera' });
     this.camData = new ArrayBuffer(CAMERA_SIZE);
     this.camera = new OrbitCamera(this.canvas, opts.camera || {});
     this.controls = opts.controls !== false;
     if (this.controls) this.camera.attach();
-    this.pointer = { x: 0, y: 0, ndc: [0, 0], down: false, buttons: 0, inside: false };
+    this.pointer = { x: 0, y: 0, ndc: [0, 0], down: false, buttons: 0, inside: false, shift: false, alt: false, ctrl: false };
     this._pointerEvents();
     this.width = 0; this.height = 0;
     this._resize();
     this._ro = new ResizeObserver(() => this._resize());
     this._ro.observe(this.canvas);
+    this._watchPixelRatio();
     this.bloom = opts.bloom ? new Bloom(ctx, opts.bloom === true ? {} : opts.bloom) : null;
     this._black = ctx.texture({ size: [1, 1], format: 'rgba16float', label: 'black' });
     this.post = new RenderProgram(ctx, {
@@ -2168,20 +2389,81 @@ class View {
     if (opts.hud) this.hud = new Hud(this, opts.hud === true ? {} : opts.hud);
   }
 
-  add(layer) { this.layers.push(layer); layer.attach?.(this); return layer; }
-  remove(layer) { this.layers = this.layers.filter((l) => l !== layer); }
+  /** Add a layer (anything with draw / prepare / afterScene / overlay). Returns the layer. */
+  add(layer) {
+    if (!layer) throw new SIError('View.add: no layer given');
+    if (!this.layers.includes(layer)) { this.layers.push(layer); layer.attach?.(this); }
+    return layer;
+  }
+
+  /** Remove a layer (it is not destroyed). Returns the layer. */
+  remove(layer) {
+    if (this.layers.includes(layer)) { this.layers = this.layers.filter((l) => l !== layer); layer.detach?.(this); }
+    return layer;
+  }
+
+  /** Turn bloom on (true or { strength, ... }) or off (false) after construction. */
+  setBloom(o) {
+    if (!o) { this.bloom?.destroy?.(); this.bloom = null; return this; }
+    const opts = o === true ? {} : o;
+    if (this.bloom && opts.strength !== undefined && Object.keys(opts).length === 1) { this.bloom.strength = opts.strength; return this; }
+    this.bloom?.destroy?.();
+    this.bloom = new Bloom(this.ctx, opts);
+    return this;
+  }
+
+  /** Show (true or { extra, parent }) or hide (false) the stats overlay. */
+  setHud(o) {
+    this.hud?.destroy();
+    this.hud = o ? new Hud(this, o === true ? {} : o) : null;
+    return this;
+  }
+
+  /** Render at a different device-pixel ratio (e.g. 1 for speed). */
+  setPixelRatio(r) {
+    this._dprAuto = false;
+    this.pixelRatio = Math.max(0.25, +r || 1);
+    this._resize();
+    return this;
+  }
 
   _resize() {
+    if (this.destroyed) return;
     const w = Math.max(1, Math.floor(this.canvas.clientWidth * this.pixelRatio));
     const h = Math.max(1, Math.floor(this.canvas.clientHeight * this.pixelRatio));
     if (w === this.width && h === this.height) return;
-    this.width = w; this.height = h;
-    this.canvas.width = w; this.canvas.height = h;
+    const max = this.ctx.limits.maxTextureDimension2D || 8192;
+    const s = Math.min(1, max / w, max / h);   // a huge canvas must not exceed the texture limit
+    const W = Math.max(1, Math.floor(w * s)), H = Math.max(1, Math.floor(h * s));
+    this.width = W; this.height = H;
+    this.canvas.width = W; this.canvas.height = H;
     this.hdr?.destroy(); this.depth?.destroy();
     const TU = GPUTextureUsage;
-    this.hdr = this.ctx.texture({ size: [w, h], format: HDR_FORMAT, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING | TU.STORAGE_BINDING | TU.COPY_SRC, label: 'hdr' });
-    this.depth = this.ctx.texture({ size: [w, h], format: DEPTH_FORMAT, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING, label: 'depth' });
+    this.hdr = this.ctx.texture({ size: [W, H], format: HDR_FORMAT, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING | TU.STORAGE_BINDING | TU.COPY_SRC, label: 'hdr' });
+    this.depth = this.ctx.texture({ size: [W, H], format: DEPTH_FORMAT, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING, label: 'depth' });
     for (const l of this.layers) l.resize?.(this);
+  }
+
+  // Follow devicePixelRatio changes (window moved to another screen, browser zoom).
+  _watchPixelRatio() {
+    if (typeof matchMedia !== 'function') return;
+    let mq = null;
+    const onChange = () => {
+      if (this._dprAuto) { this.pixelRatio = Math.min(this.maxPixelRatio, window.devicePixelRatio || 1); this._resize(); }
+      watch();
+    };
+    const watch = () => {
+      mq?.removeEventListener?.('change', onChange);
+      mq = matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+      mq.addEventListener?.('change', onChange);
+    };
+    watch();
+    this._off.push(() => mq?.removeEventListener?.('change', onChange));
+  }
+
+  _listen(target, type, fn, opts) {
+    target.addEventListener(type, fn, opts);
+    this._off.push(() => target.removeEventListener(type, fn, opts));
   }
 
   _pointerEvents() {
@@ -2189,13 +2471,14 @@ class View {
     const upd = (e) => {
       const r = c.getBoundingClientRect();
       p.x = e.clientX - r.left; p.y = e.clientY - r.top;
-      p.ndc = [(p.x / r.width) * 2 - 1, 1 - (p.y / r.height) * 2];
+      p.ndc = [(p.x / (r.width || 1)) * 2 - 1, 1 - (p.y / (r.height || 1)) * 2];
       p.buttons = e.buttons; p.shift = e.shiftKey; p.alt = e.altKey; p.ctrl = e.ctrlKey || e.metaKey;
     };
-    c.addEventListener('pointermove', (e) => { upd(e); p.inside = true; });
-    c.addEventListener('pointerdown', (e) => { upd(e); p.down = true; });
-    window.addEventListener('pointerup', (e) => { p.down = false; p.buttons = e.buttons; });
-    c.addEventListener('pointerleave', () => { p.inside = false; });
+    this._listen(c, 'pointermove', (e) => { upd(e); p.inside = true; });
+    this._listen(c, 'pointerdown', (e) => { upd(e); p.down = true; });
+    this._listen(window, 'pointerup', (e) => { p.down = false; p.buttons = e.buttons; });
+    this._listen(window, 'pointercancel', () => { p.down = false; p.buttons = 0; });
+    this._listen(c, 'pointerleave', () => { p.inside = false; });
   }
 
   /** World-space ray through the pointer (or an NDC point). */
@@ -2228,6 +2511,7 @@ class View {
 
   /** Record the frame: layer prepare, scene pass, tonemap, overlays; then submit. */
   render() {
+    if (this.destroyed) return this;
     const ctx = this.ctx;
     this.updateCamera();
     for (const l of this.layers) l.prepare?.(this);
@@ -2242,56 +2526,106 @@ class View {
     const bloomTex = this.bloom ? this.bloom.run(this.hdr) : this._black;
     const target = this.context.getCurrentTexture().createView();
     const out = ctx.renderPass({ colorAttachments: [{ view: target, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
-    const mode = { agx: 0, aces: 1, neutral: 2, reinhard: 3, none: 4 }[this.tonemap] ?? 0;
+    const mode = TONEMAPS[this.tonemap] ?? 0;
     this.post.draw(out, this, 3, 1, { exposure: this.exposure, mode, bloomStrength: this.bloom ? this.bloom.strength : 0 },
       { hdr: this.hdr, bloomTex });
     for (const l of this.layers) l.overlay?.(out, this);
     out.end();
     ctx.flush();
+    return this;
   }
 
-  /** Start the frame loop. update({ dt, time, frame, view }) records simulation work. */
+  /**
+   * Start (or resume) the frame loop. update({ dt, time, frame, view }) records simulation work
+   * before every frame; calling run() again replaces the callback (run() with no argument keeps it).
+   * An exception stops the loop and is passed to opts.onError, or shown over the canvas.
+   */
   run(update) {
-    this._update = update;
+    if (this.destroyed) throw new SIError('View.run: the view was destroyed');
+    if (update !== undefined) this.onFrame = update;
+    this._stopped = false;
+    if (this._raf) return this;   // already running: one loop per view
     let last = performance.now();
     const tick = (now) => {
-      if (this._stopped) return;
+      this._raf = 0;
+      if (this._stopped || this.destroyed) return;
       this.dt = Math.min(1 / 20, Math.max(1e-4, (now - last) / 1000));
       last = now;
       this.camera.update(this.dt);
       try {
-        update?.({ dt: this.dt, time: this.time, frame: this.frame, view: this });
+        this.onFrame?.({ dt: this.dt, time: this.time, frame: this.frame, view: this });
         this.render();
       } catch (e) {
-        console.error(e);
         this._stopped = true;
-        showError(this.canvas, e);
+        this._fail(e);
         return;
       }
       this.hud?.update(now);
       this.time += this.dt;
       this.frame++;
-      requestAnimationFrame(tick);
+      // (an update that called stop() and run() has already scheduled the next frame)
+      if (!this._stopped && !this.destroyed && !this._raf) this._raf = requestAnimationFrame(tick);
     };
-    requestAnimationFrame(tick);
+    this._raf = requestAnimationFrame(tick);
     return this;
   }
 
-  stop() { this._stopped = true; }
+  /** Pause the frame loop (run() resumes it). */
+  stop() {
+    this._stopped = true;
+    if (this._raf) { cancelAnimationFrame(this._raf); this._raf = 0; }
+    return this;
+  }
+
+  /** True while the frame loop is scheduled. */
+  get running() { return !this._stopped && !this.destroyed; }
 
   /** Advance one frame without the animation loop (tests, video capture, headless runs). */
   step(dt = 1 / 60) {
+    if (this.destroyed) return this;
     this.dt = dt;
     this.camera.update(dt);
-    this._update?.({ dt, time: this.time, frame: this.frame, view: this });
+    this.onFrame?.({ dt, time: this.time, frame: this.frame, view: this });
     this.render();
     this.time += dt;
     this.frame++;
     return this;
   }
+
+  _fail(e) {
+    if (this.onError) { try { this.onError(e); } catch (e2) { console.error(e2); } return; }
+    console.error(e);
+    this._errorEl = showError(this.canvas, e);
+  }
+
+  /**
+   * Stop the loop, remove listeners, observers and the HUD, unconfigure the canvas and free the
+   * view's GPU textures. With { layers: true } the attached layers are destroyed too.
+   */
+  destroy({ layers = false } = {}) {
+    if (this.destroyed) return;
+    this.stop();
+    this.destroyed = true;
+    this._ro?.disconnect();
+    for (const off of this._off.splice(0)) off();
+    this.camera.detach();
+    this.hud?.destroy();
+    this._errorEl?.remove();
+    for (const l of this.layers) { l.detach?.(this); if (layers) l.destroy?.(); }
+    this.layers = [];
+    this.bloom?.destroy?.();
+    for (const t of [this.hdr, this.depth, this._black]) t?.destroy();
+    this.cameraBuffer.destroy();
+    try { this.context.unconfigure(); } catch { /* the device may already be gone */ }
+  }
 }
 
-/** Orbit camera with damping: drag = rotate, right/shift-drag = pan, wheel/pinch = zoom. */
+/**
+ * Orbit camera with damping: drag = rotate, right/shift-drag = pan, wheel/pinch = zoom.
+ * Options: target, distance, yaw, pitch (rad), fov (deg), near, far, minDistance, maxDistance,
+ * minPitch, maxPitch, autoRotate (rad/s), damping, rotateSpeed, zoomSpeed, panSpeed.
+ * Set camera.enabled = false to ignore input without detaching.
+ */
 class OrbitCamera {
   constructor(el, o = {}) {
     this.el = el;
@@ -2305,9 +2639,28 @@ class OrbitCamera {
     this.up = [0, 1, 0];
     this.minDistance = o.minDistance ?? 0.05;
     this.maxDistance = o.maxDistance ?? 100;
+    this.minPitch = o.minPitch ?? -1.55;
+    this.maxPitch = o.maxPitch ?? 1.55;
     this.autoRotate = o.autoRotate ?? 0;
+    this.rotateSpeed = o.rotateSpeed ?? 1;
+    this.zoomSpeed = o.zoomSpeed ?? 1;
+    this.panSpeed = o.panSpeed ?? 1;
+    this.enabled = o.enabled ?? true;
     this.vel = { yaw: 0, pitch: 0, zoom: 0, px: 0, py: 0 };
-    this.damping = 8;
+    this.damping = o.damping ?? 8;
+    this._off = [];
+  }
+  /** Field of view in degrees. */
+  get fov() { return (this.fovY * 180) / Math.PI; }
+  set fov(deg) { this.fovY = (deg * Math.PI) / 180; }
+  /** Update any of the constructor options at once (e.g. to frame a new scene). */
+  set(o = {}) {
+    for (const k of ['distance', 'yaw', 'pitch', 'near', 'far', 'minDistance', 'maxDistance', 'minPitch', 'maxPitch',
+      'autoRotate', 'damping', 'rotateSpeed', 'zoomSpeed', 'panSpeed', 'enabled']) if (o[k] !== undefined) this[k] = o[k];
+    if (o.target) this.target = [...o.target];
+    if (o.fov !== undefined) this.fov = o.fov;
+    this.vel = { yaw: 0, pitch: 0, zoom: 0, px: 0, py: 0 };
+    return this;
   }
   eye() {
     const cp = Math.cos(this.pitch), sp = Math.sin(this.pitch);
@@ -2315,41 +2668,51 @@ class OrbitCamera {
       this.target[2] + this.distance * cp * Math.cos(this.yaw)];
   }
   attach() {
+    if (this._off.length) return this;
     const el = this.el;
     const ptrs = new Map();
     let pinch = 0;
+    const on = (target, type, fn, opts) => { target.addEventListener(type, fn, opts); this._off.push(() => target.removeEventListener(type, fn, opts)); };
+    const prevTouch = el.style.touchAction;
     el.style.touchAction = 'none';
-    el.addEventListener('contextmenu', (e) => e.preventDefault());
-    el.addEventListener('pointerdown', (e) => {
-      if (e.altKey || e.ctrlKey || e.metaKey) return; // modifier-drag is reserved for app interaction
-      el.setPointerCapture(e.pointerId);
+    this._off.push(() => { el.style.touchAction = prevTouch; });
+    on(el, 'contextmenu', (e) => e.preventDefault());
+    on(el, 'pointerdown', (e) => {
+      if (!this.enabled || e.altKey || e.ctrlKey || e.metaKey) return; // modifier-drag is reserved for app interaction
+      el.setPointerCapture?.(e.pointerId);
       ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY, pan: e.button === 2 || e.shiftKey });
     });
-    el.addEventListener('pointermove', (e) => {
+    on(el, 'pointermove', (e) => {
       const p = ptrs.get(e.pointerId);
-      if (!p) return;
+      if (!p || !this.enabled) return;
       const dx = e.clientX - p.x, dy = e.clientY - p.y;
       p.x = e.clientX; p.y = e.clientY;
       if (ptrs.size === 2) {
         const [a, b] = [...ptrs.values()];
         const d = Math.hypot(a.x - b.x, a.y - b.y);
-        if (pinch) this.vel.zoom += (pinch - d) * 0.01;
+        if (pinch) this.vel.zoom += (pinch - d) * 0.01 * this.zoomSpeed;
         pinch = d;
         return;
       }
-      const s = 1 / el.clientHeight;
-      if (p.pan) { this.vel.px += -dx * s * this.distance; this.vel.py += dy * s * this.distance; }
-      else { this.vel.yaw -= dx * s * 4; this.vel.pitch += dy * s * 4; }
+      const s = 1 / (el.clientHeight || 1);
+      if (p.pan) { this.vel.px += -dx * s * this.distance * this.panSpeed; this.vel.py += dy * s * this.distance * this.panSpeed; }
+      else { this.vel.yaw -= dx * s * 4 * this.rotateSpeed; this.vel.pitch += dy * s * 4 * this.rotateSpeed; }
     });
     const end = (e) => { ptrs.delete(e.pointerId); if (ptrs.size < 2) pinch = 0; };
-    el.addEventListener('pointerup', end);
-    el.addEventListener('pointercancel', end);
-    el.addEventListener('wheel', (e) => { e.preventDefault(); this.vel.zoom += e.deltaY * 0.0015; }, { passive: false });
+    on(el, 'pointerup', end);
+    on(el, 'pointercancel', end);
+    on(el, 'wheel', (e) => { if (!this.enabled) return; e.preventDefault(); this.vel.zoom += e.deltaY * 0.0015 * this.zoomSpeed; }, { passive: false });
+    return this;
+  }
+  /** Remove the input listeners added by attach(). */
+  detach() {
+    for (const off of this._off.splice(0)) off();
+    return this;
   }
   update(dt) {
     const k = Math.min(1, this.damping * dt), v = this.vel;
     this.yaw += v.yaw * k + this.autoRotate * dt;
-    this.pitch = Math.max(-1.55, Math.min(1.55, this.pitch + v.pitch * k));
+    this.pitch = Math.max(this.minPitch, Math.min(this.maxPitch, this.pitch + v.pitch * k));
     this.distance = Math.max(this.minDistance, Math.min(this.maxDistance, this.distance * Math.exp(v.zoom * k)));
     const cy = Math.cos(this.yaw), sy = Math.sin(this.yaw);
     const right = [cy, 0, -sy];
@@ -2369,10 +2732,11 @@ class Hud {
       position: 'absolute', left: '10px', top: '10px', padding: '8px 10px', font: '11px/1.45 ui-monospace,Menlo,monospace',
       color: '#d8dee9', background: 'rgba(10,12,16,0.72)', borderRadius: '6px', pointerEvents: 'none', whiteSpace: 'pre', zIndex: 10,
     });
-    (o.parent || view.canvas.parentElement).appendChild(this.el);
+    (o.parent || view.canvas.parentElement || document.body).appendChild(this.el);
     this.extra = o.extra || null;
     this.frames = 0; this.t0 = performance.now(); this.fps = 0;
   }
+  destroy() { this.el.remove(); }
   update(now) {
     this.frames++;
     if (now - this.t0 < 500) return;
@@ -2394,13 +2758,14 @@ function showError(canvas, e) {
     font: '12px/1.5 ui-monospace,Menlo,monospace', whiteSpace: 'pre-wrap', overflow: 'auto', zIndex: 20 });
   div.textContent = String(e && (e.message || e));
   (canvas?.parentElement || document.body).appendChild(div);
+  return div;
 }
 return { HDR_FORMAT, DEPTH_FORMAT, View, OrbitCamera, Hud, showError };
 })();
 
 // ---- src/render/fullscreen.js
-const __m14 = (() => {
-const RenderProgram = __m11.RenderProgram;
+const __m16 = (() => {
+const RenderProgram = __m13.RenderProgram;
 // Fullscreen shader layer — a Shadertoy-style canvas backed by the shader library.
 //
 //   view.add(gpu.fullscreen({
@@ -2422,7 +2787,9 @@ class Fullscreen {
       name: desc.name || 'fullscreen',
       imports: desc.imports, uniforms: desc.uniforms, textures: desc.textures, samplers: desc.samplers,
       buffers: desc.buffers, defines: desc.defines, values: desc.values,
-      depth: { write: !!desc.writeDepth, compare: 'always' },
+      // 'always' draws over what earlier layers drew (a background layer goes first); a layer that
+      // writes real depth can pass depthCompare: 'less-equal' to be order-independent
+      depth: { write: !!desc.writeDepth, compare: desc.depthCompare || 'always' },
       targets: desc.targets,
       code: /* wgsl */`
         struct FsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f }
@@ -2452,13 +2819,15 @@ class Fullscreen {
   set(values) { this.program.set(values); return this; }
   bind(resources) { this.program.bind(resources); return this; }
   draw(pass, view) { this.program.draw(pass, view, 3, 1); }
+  /** Layers own no GPU memory beyond their pipeline (garbage-collected); kept for a uniform API. */
+  destroy() { this.destroyed = true; }
 }
 return { Fullscreen };
 })();
 
 // ---- src/render/spheres.js
-const __m15 = (() => {
-const RenderProgram = __m11.RenderProgram;
+const __m17 = (() => {
+const RenderProgram = __m13.RenderProgram;
 // Ray-cast sphere impostors for particle buffers. Each particle is a camera-
 // facing quad; the fragment shader intersects the exact sphere, so silhouettes,
 // depth and normals are pixel-perfect at 4 vertices per particle.
@@ -2551,9 +2920,12 @@ class Spheres {
   set(v) { Object.assign(this.values, v); this.program.set(v); return this; }
   get count() { const c = this.o.count; return typeof c === 'function' ? c() : c ?? this.o.data.length; }
   draw(pass, view) {
+    if (this.o.data?.destroyed) return;
     const n = this.count;
     if (n > 0) this.program.draw(pass, view, 4, n);
   }
+  /** Layers own no GPU memory beyond their pipeline (garbage-collected); kept for a uniform API. */
+  destroy() { this.destroyed = true; }
 }
 
 function normalize3(v) { const l = Math.hypot(...v) || 1; return v.map((x) => x / l); }
@@ -2561,10 +2933,12 @@ return { Spheres };
 })();
 
 // ---- src/render/scene.js
-const __m16 = (() => {
-const Fullscreen = __m14.Fullscreen;
-const RenderProgram = __m11.RenderProgram;
+const __m18 = (() => {
+const Fullscreen = __m16.Fullscreen;
+const RenderProgram = __m13.RenderProgram;
+const destroyAll = __m9.destroyAll;
 // Scene helpers: a sky + ground "stage" and simple line geometry (box outlines).
+
 
 
 
@@ -2572,7 +2946,9 @@ const RenderProgram = __m11.RenderProgram;
 class Stage {
   constructor(ctx, o = {}) {
     this.layer = new Fullscreen(ctx, {
-      name: 'stage', writeDepth: true, imports: ['color', 'pbr'],
+      // less-equal: the sky (depth 1.0) only fills what nothing drew, the floor depth-tests — so the
+      // stage can be added before or after other layers
+      name: 'stage', writeDepth: true, depthCompare: 'less-equal', imports: ['color', 'pbr'],
       uniforms: { height: 'f32', cell: 'f32', groundColor: 'vec3f', lineColor: 'vec3f', skyTop: 'vec3f', skyBottom: 'vec3f', fog: 'f32', sun: 'vec3f' },
       values: {
         height: o.height ?? 0, cell: o.cell ?? 0.1,
@@ -2606,15 +2982,16 @@ class Stage {
   }
   set(v) { this.layer.set(v); return this; }
   draw(pass, view) { this.layer.draw(pass, view); }
+  destroy() { this.layer.destroy(); }
 }
 
 /** Colored line segments (line-list) from a Float32Array of xyz pairs. */
 class Lines {
   constructor(ctx, o) {
     this.ctx = ctx;
-    const pts = o.points;
-    this.count = pts.length / 3;
-    this.data = ctx.array('vec4f', this.count);
+    const pts = o.points || [];
+    this.count = Math.floor(pts.length / 3);
+    this.data = ctx.array('vec4f', Math.max(1, this.count));   // an empty set still gets a (unused) buffer
     const v4 = new Float32Array(this.count * 4);
     for (let k = 0; k < this.count; k++) { v4[4 * k] = pts[3 * k]; v4[4 * k + 1] = pts[3 * k + 1]; v4[4 * k + 2] = pts[3 * k + 2]; v4[4 * k + 3] = 1; }
     this.data.write(v4);
@@ -2629,7 +3006,9 @@ class Lines {
     });
     this.program.bind({ L: this.data });
   }
-  draw(pass, view) { this.program.draw(pass, view, this.count); }
+  set(v) { this.program.set(v); return this; }
+  draw(pass, view) { if (this.count) this.program.draw(pass, view, this.count); }
+  destroy() { destroyAll(this.data); }
 
   /** Wireframe box from min/max corners. */
   static box(ctx, min, max, color) {
@@ -2644,7 +3023,7 @@ return { Stage, Lines };
 })();
 
 // ---- src/ui.js
-const __m17 = (() => {
+const __m19 = (() => {
 // Tiny zero-dependency control panel for examples.
 //   const ui = panel('Fluid', [
 //     { label: 'substeps', min: 1, max: 16, step: 1, value: 8, onInput: (v) => (sim.substeps = v) },
@@ -2667,6 +3046,7 @@ const CSS = `
 .si-panel button:hover { background: #2b3d51; }
 .si-panel select { width: 100%; background: #1b232d; color: #e6edf3; border: 1px solid #344558; border-radius: 4px; padding: 3px; font: inherit; }
 .si-panel .note { color: #8b9bb0; margin-top: 8px; font-size: 11px; }
+.si-panel a { color: #6cb6ff; }
 `;
 
 let styled = false;
@@ -2714,7 +3094,9 @@ function panel(title, controls = [], parent = document.body) {
       r.type = 'range'; r.min = c.min ?? 0; r.max = c.max ?? 1; r.step = c.step ?? 0.01; r.value = c.value ?? 0;
       const val = document.createElement('span');
       val.className = 'val';
-      const dec = Math.max(0, Math.min(6, -Math.floor(Math.log10(+(c.step ?? 0.01)) + 1e-9)));
+      // as many decimals as the step has (0.25 → 2, 2.5 → 1, 5 → 0)
+      const stepStr = String(c.step ?? 0.01);
+      const dec = /e-(\d+)$/.test(stepStr) ? Math.min(6, +RegExp.$1) : Math.min(6, (stepStr.split('.')[1] || '').length);
       const fmt = (v) => (+v).toFixed(dec);
       val.textContent = fmt(r.value);
       api.values[c.label] = +r.value;
@@ -2730,8 +3112,10 @@ return { panel };
 })();
 
 // ---- src/render/fluid.js
-const __m19 = (() => {
-const RenderProgram = __m11.RenderProgram;
+const __m21 = (() => {
+const RenderProgram = __m13.RenderProgram;
+const destroyAll = __m9.destroyAll;
+const SIError = __m4.SIError;
 // Screen-space fluid rendering (van der Laan, Green & Sainz 2009) with a
 // narrow-range depth filter (after Truong & Yuksel, I3D 2018).
 //
@@ -2743,6 +3127,8 @@ const RenderProgram = __m11.RenderProgram;
 //   4. composite      normals from the smoothed depth; Fresnel (Schlick, F0 = 0.02),
 //                     sky reflection, refraction of the opaque scene with Beer–Lambert
 //                     absorption over the thickness, sun specular; writes depth.
+
+
 
 
 class FluidSurface {
@@ -2863,9 +3249,12 @@ class FluidSurface {
           let dxn = pc - viewPos(max(px - vec2i(1, 0), vec2i(0)));
           let dyp = viewPos(min(px + vec2i(0, 1), sz)) - pc;
           let dyn = pc - viewPos(max(px - vec2i(0, 1), vec2i(0)));
-          let ddx = select(dxp, dxn, abs(dxn.z) < abs(dxp.z));
-          let ddy = select(dyp, dyn, abs(dyn.z) < abs(dyp.z));
-          var nv = normalize(cross(ddy, ddx));
+          // one-sided differences at the screen border (the clamped neighbour is the pixel itself)
+          let ddx = select(dxp, dxn, (abs(dxn.z) < abs(dxp.z) && px.x > 0) || px.x >= sz.x);
+          let ddy = select(dyp, dyn, (abs(dyn.z) < abs(dyp.z) && px.y > 0) || px.y >= sz.y);
+          let cr = cross(ddy, ddx);
+          let cl = length(cr);
+          var nv = select(vec3f(0.0, 0.0, 1.0), cr / max(cl, 1e-30), cl > 1e-20);
           if (nv.z < 0.0) { nv = -nv; }
           let n = normalize((cam.invView * vec4f(nv, 0.0)).xyz);
           let wp = (cam.invView * vec4f(pc, 1.0)).xyz;
@@ -2890,7 +3279,16 @@ class FluidSurface {
     this.w = 0; this.h = 0;
   }
 
-  set(v) { Object.assign(this.values, v); return this; }
+  /** Update the look (radius, absorb, tint, refraction, filterRadius, ...) or the filter iterations; unknown names throw. */
+  set(v) {
+    const o = { ...v };
+    if ('iterations' in o) { this.iterations = Math.max(0, o.iterations | 0); delete o.iterations; }
+    if (o.sun) o.sun = norm(o.sun);
+    for (const k of Object.keys(o))
+      if (!(k in this.values)) throw new SIError(`FluidSurface.set: unknown value "${k}" (use ${Object.keys(this.values).join(', ')}, iterations)`, 'invalid-argument');
+    Object.assign(this.values, o);
+    return this;
+  }
 
   _alloc(w, h) {
     for (const t of [this.zA, this.zB, this.zDepth, this.thick, this.sceneCopy]) t?.destroy();
@@ -2907,6 +3305,7 @@ class FluidSurface {
   get count() { const c = this.o.count; return typeof c === 'function' ? c() : c ?? this.data.length; }
 
   afterScene(view) {
+    if (this.destroyed || this.data?.destroyed) return;
     const n = this.count;
     if (!n) return;
     if (view.width !== this.w || view.height !== this.h) this._alloc(view.width, view.height);
@@ -2943,6 +3342,7 @@ class FluidSurface {
       { zTex: this.zA, thick: this.thick, scene: this.sceneCopy });
     pass.end();
   }
+  destroy() { this.destroyed = true; destroyAll(this.zA, this.zB, this.zDepth, this.thick, this.sceneCopy); this.zA = null; this.w = this.h = 0; }
 }
 
 function norm(v) { const l = Math.hypot(...v) || 1; return v.map((x) => x / l); }
@@ -2950,8 +3350,8 @@ return { FluidSurface };
 })();
 
 // ---- src/shaders/math.js
-const __m22 = (() => {
-const defineModule = __m5.defineModule;
+const __m24 = (() => {
+const defineModule = __m6.defineModule;
 
 
 defineModule('math', {
@@ -3020,8 +3420,8 @@ return {  };
 })();
 
 // ---- src/shaders/linalg.js
-const __m23 = (() => {
-const defineModule = __m5.defineModule;
+const __m25 = (() => {
+const defineModule = __m6.defineModule;
 
 
 // Small dense linear algebra for physics kernels: outer products, 3x3 symmetric
@@ -3103,8 +3503,8 @@ return {  };
 })();
 
 // ---- src/shaders/hash.js
-const __m24 = (() => {
-const defineModule = __m5.defineModule;
+const __m26 = (() => {
+const defineModule = __m6.defineModule;
 
 
 // Integer hashing. Float "fract(sin(x) * 43758.5453)" hashes are both slower
@@ -3215,8 +3615,8 @@ return {  };
 })();
 
 // ---- src/physics/rigid-wgsl.js
-const __m21 = (() => {
-const defineModule = __m5.defineModule;
+const __m23 = (() => {
+const defineModule = __m6.defineModule;
 // WGSL for the rigid-body solver (physics/rigid.js): data layouts, linearised
 // contacts, joint constraint rows, the register-resident 6×6 Newton solve,
 // narrowphase manifolds (sphere, box, capsule, floor) and ray tests.
@@ -3854,8 +4254,9 @@ return { BODY_VEC4, CONTACT_VEC4, JOINT_VEC4, SHAPES, FLAGS, JOINT_TYPES, JOINT_
 })();
 
 // ---- src/physics/coupling.js
-const __m20 = (() => {
-const defineModule = __m5.defineModule;
+const __m22 = (() => {
+const defineModule = __m6.defineModule;
+const destroyAll = __m9.destroyAll;
 // Two-way coupling between MLS-MPM materials (water, sand, snow, jelly) and a RigidWorld.
 //
 // Rigid bodies are moving boundaries of the MPM grid. After every MPM grid update, each
@@ -3877,6 +4278,7 @@ const defineModule = __m5.defineModule;
 // Units: MPM works in lattice units (cells, substeps, density × cells); the rigid world in
 // metres, seconds and density × m³ (density 1 = water in both). A lattice momentum p' is
 // p' dx⁴/Δt_s in world units.
+
 
 
 
@@ -3923,7 +4325,7 @@ class FluidRigidCoupling {
   /**
    * @param sim   MPM solver
    * @param world RigidWorld
-   * o: friction (fluid–body, default 0.2), band (cells, default 1.5), mask (collision group bits of
+   * o: friction (fluid–body, default 0.2), band (cells, default 0.5), mask (collision group bits of
    *    bodies that interact, default all), densityScale (rigid mass per MPM density unit per m³, default 1)
    */
   constructor(ctx, sim, world, o = {}) {
@@ -4050,8 +4452,15 @@ class FluidRigidCoupling {
     this.tiles = dims.map((d) => Math.ceil(d / 4));
   }
 
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    destroyAll(this.acc);
+  }
+
   /** Called by MPM after the grid update of substep s. */
   substep(s) {
+    if (this.destroyed || this.world.destroyed || this.sim.destroyed) return;
     const w = this.world, sim = this.sim;
     if (!this.enabled || !w.count) return;
     const dts = sim.substepDt;
@@ -4063,6 +4472,7 @@ class FluidRigidCoupling {
 
   /** Called by MPM after its frame: hand the accumulated impulses to the rigid world. */
   finish() {
+    if (this.destroyed || this.world.destroyed || this.sim.destroyed) return;
     const w = this.world, sim = this.sim;
     if (!this.enabled || !w.count) return;
     const dx = sim.dx;
@@ -4073,12 +4483,14 @@ return { FluidRigidCoupling };
 })();
 
 // ---- src/physics/mpm.js
-const __m18 = (() => {
-const defineModule = __m5.defineModule;
-const Scan = __m7.Scan;
-const Spheres = __m15.Spheres;
-const FluidSurface = __m19.FluidSurface;
-const FluidRigidCoupling = __m20.FluidRigidCoupling;
+const __m20 = (() => {
+const defineModule = __m6.defineModule;
+const Scan = __m8.Scan;
+const Spheres = __m17.Spheres;
+const FluidSurface = __m21.FluidSurface;
+const FluidRigidCoupling = __m22.FluidRigidCoupling;
+const destroyAll = __m9.destroyAll;
+const SIError = __m4.SIError;
 // MLS-MPM (Hu et al. 2018) with APIC transfers, multi-material, in lattice units.
 //
 // First principles that shape this solver:
@@ -4104,7 +4516,16 @@ const FluidRigidCoupling = __m20.FluidRigidCoupling;
 
 
 
-const FLUID = 0, JELLY = 1, SNOW = 2, SAND = 3;
+
+
+const FLUID = 0;
+const JELLY = 1;
+const SNOW = 2;
+const SAND = 3;
+/** Material kinds by name (MaterialDef.kind accepts the number or the name). */
+const MPM_KINDS = { fluid: FLUID, jelly: JELLY, elastic: JELLY, snow: SNOW, sand: SAND };
+const MAX_DENSITY = 50;     // relative to water; the 2^22 fixed-point grid overflows near ~300
+const MAX_VISCOSITY = 4;    // explicit viscosity is stable up to a diffusion number of ~1/6 per substep
 
 /** Material presets. stiffness ∈ (0,1] is a fraction of the max stable lattice wave speed. */
 const MATERIALS = {
@@ -4156,7 +4577,7 @@ class MPM {
    * @param {Context} ctx
    * @param {object} o
    *   maxParticles, grid: cells along the longest axis (default 64), size: [x,y,z] world size (default [1,1,1]),
-   *   origin, gravity (m/s^2), substeps (per 1/60 s), timeScale, sortEvery, ppc (particles per cell axis^3, default 8)
+   *   origin, gravity (m/s^2), substeps (per 1/60 s), timeScale, sortEvery, ppcAxis (particles per cell along each axis, default 2)
    */
   constructor(ctx, o = {}) {
     this.ctx = ctx;
@@ -4168,8 +4589,8 @@ class MPM {
     this.size = this.dims.map((d) => d * this.dx);
     this.origin = o.origin || [0, 0, 0];
     this.gravity = o.gravity || [0, -9.81, 0];
-    this.substeps = o.substeps || 8;
-    this.timeScale = o.timeScale ?? 1;
+    this._substeps = Math.max(1, Math.round(o.substeps || 8));
+    this._timeScale = o.timeScale ?? 1;
     this.sortEvery = o.sortEvery || 4;
     this.ppcAxis = o.ppcAxis || 2;
     this.bound = 3;
@@ -4201,13 +4622,37 @@ class MPM {
   /** World-space time step of one substep. */
   get substepDt() { return (1 / 60) * this.timeScale / this.substeps; }
 
+  /**
+   * Substeps per frame and time scale can change at any time: particle velocities are stored in
+   * cells per substep, so they are rescaled to keep their physical speed.
+   */
+  get substeps() { return this._substeps; }
+  set substeps(n) { this._retime(() => { this._substeps = Math.max(1, Math.round(n)); }); }
+  get timeScale() { return this._timeScale; }
+  set timeScale(x) { this._retime(() => { this._timeScale = Math.max(1e-6, +x); }); }
+  _retime(change) {
+    const before = this.substepDt;
+    change();
+    const k = this.substepDt / before;
+    if (this.count && this.rescaleK && Math.abs(k - 1) > 1e-12) this.rescaleK.run(this.count, { k }, { P: this.P });
+  }
+
   // ------------------------------------------------------------------ materials
   _material(nameOrDef) {
     const def = typeof nameOrDef === 'string' ? { ...MATERIALS[nameOrDef], name: nameOrDef } : { ...nameOrDef };
-    if (!def || def.kind === undefined) throw new Error(`MPM: unknown material ${nameOrDef}`);
+    if (!def || def.kind === undefined)
+      throw new SIError(`MPM: unknown material ${JSON.stringify(nameOrDef)} (use ${Object.keys(MATERIALS).join(', ')} or a definition with a kind)`, 'invalid-argument');
+    if (typeof def.kind === 'string') {
+      if (!(def.kind in MPM_KINDS)) throw new SIError(`MPM: unknown material kind "${def.kind}" (use ${Object.keys(MPM_KINDS).join(', ')})`, 'invalid-argument');
+      def.kind = MPM_KINDS[def.kind];
+    }
+    if (![FLUID, JELLY, SNOW, SAND].includes(def.kind)) throw new SIError(`MPM: material kind must be 0–3 (got ${def.kind})`, 'invalid-argument');
+    const density = def.density ?? 1;
+    if (!(density > 0 && density <= MAX_DENSITY))
+      throw new SIError(`MPM: density ${density} is outside (0, ${MAX_DENSITY}] — densities are relative to water (1), not kg/m³`, 'invalid-argument');
     const key = JSON.stringify(def);
     if (this.materialIndex.has(key)) return this.materialIndex.get(key);
-    if (this.materials.length >= 8) throw new Error('MPM: at most 8 distinct materials');
+    if (this.materials.length >= 8) throw new SIError('MPM: at most 8 distinct materials at once (clear() frees them)', 'invalid-argument');
     const idx = this.materials.length;
     this.materials.push(def);
     this.materialIndex.set(key, idx);
@@ -4223,18 +4668,18 @@ class MPM {
       const mass = (m.density ?? 1) * vol;          // lattice mass: rho' = density (relative) per cell
       const rho = mass / vol;
       const c = C_MAX * Math.min(1, Math.max(0.01, m.stiffness ?? 1));
-      const nu = m.poisson ?? 0.3;
-      // P-wave modulus M = lambda + 2 mu = rho c^2; recover E, mu, lambda from Poisson's ratio.
+      const nu = Math.min(0.49, Math.max(0, m.poisson ?? 0.3));   // 0.5 (incompressible) has no shear stiffness: 0/0 below
+      // P-wave modulus M = lambda + 2 mu = rho c^2; split it by Poisson's ratio directly
+      // (through E, nu = 0.5 is 0/0): lambda = M nu / (1 - nu), mu = M (1 - 2 nu) / (2 (1 - nu)).
       const Mmod = rho * c * c;
-      const E = Mmod * (1 + nu) * (1 - 2 * nu) / (1 - nu);
-      const mu = E / (2 * (1 + nu));
-      const la = E * nu / ((1 + nu) * (1 - 2 * nu));
+      const mu = Mmod * (1 - 2 * nu) / (2 * (1 - nu));
+      const la = Mmod * nu / (1 - nu);
       const o = k * 12;
       u[o] = m.kind;
       data[o + 1] = mass;
       data[o + 2] = m.kind === FLUID ? rho * c * c : mu;   // fluids: bulk modulus K
       data[o + 3] = la;
-      data[o + 4] = (m.viscosity ?? 0) * 0.05 * rho;       // lattice dynamic viscosity
+      data[o + 4] = Math.min(MAX_VISCOSITY, Math.max(0, m.viscosity ?? 0)) * 0.05 * rho;   // lattice dynamic viscosity, clamped to what is stable
       data[o + 5] = m.hardening ?? 10;
       data[o + 6] = m.compression ?? 0.025;
       data[o + 7] = m.stretch ?? 0.0075;
@@ -4242,6 +4687,7 @@ class MPM {
       const sinp = Math.sin(phi);
       data[o + 8] = Math.sqrt(2 / 3) * (2 * sinp) / (3 - sinp); // Drucker–Prager alpha
     });
+    this.ctx.flush();   // materials change between batches; recorded steps keep the old ones
     this.matBuf.write(data);
   }
 
@@ -4278,8 +4724,15 @@ class MPM {
     return n;
   }
 
-  /** Remove every particle. */
-  clear() { this.count = 0; }
+  /**
+   * Remove every particle. The material table is emptied too (no particle uses it any more), so a
+   * new scene can use up to 8 materials of its own.
+   */
+  clear() {
+    this.count = 0;
+    this.materials = [];
+    this.materialIndex.clear();
+  }
 
   /**
    * Two-way coupling with a RigidWorld: bodies become moving boundaries of this material and
@@ -4287,8 +4740,23 @@ class MPM {
    * then the rigid world, each frame. o: { friction, band, mask, densityScale } (see coupling.js).
    */
   couple(world, o = {}) {
+    this.coupling?.destroy();
     this.coupling = new FluidRigidCoupling(this.ctx, this, world, o);
     return this.coupling;
+  }
+
+  /** End the coupling made by couple() (bodies no longer feel the fluid, nor the fluid the bodies). */
+  decouple() {
+    this.coupling?.destroy();
+    this.coupling = null;
+  }
+
+  /** Free every GPU buffer of the simulation (and of its coupling). Layers made by fluid() / spheres() are destroyed separately. */
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    destroyAll(this.P, this.P2, this.grid, this.matBuf, this.colBuf, this.blockCount, this.key, this.rank, this.scan, this.coupling);
+    this.coupling = null;
   }
 
   // ------------------------------------------------------------------ colliders
@@ -4314,7 +4782,7 @@ class MPM {
       const v = c.velocity || [0, 0, 0];
       data[o + 8] = v[0] * s; data[o + 9] = v[1] * s; data[o + 10] = v[2] * s;
     });
-    this.colBuf.write(data);
+    this.colBuf.writeOrdered(data);   // ordered: several step() calls in one batch each see their own colliders
   }
 
   // ------------------------------------------------------------------ kernels
@@ -4426,6 +4894,16 @@ class MPM {
     });
 
     // --- grid update: momentum -> velocity, gravity, walls, colliders
+    // velocities (v) and velocity gradients (C) are per substep: rescale them when the substep changes
+    this.rescaleK = ctx.kernel({
+      name: 'mpm-retime', buffers: { P: { type: 'vec4f' } }, uniforms: { k: 'f32' },
+      code: /* wgsl */`
+        let b = 8u * i;
+        P[b + 1u] = vec4f(P[b + 1u].xyz * u.k, P[b + 1u].w);
+        P[b + 2u] = vec4f(P[b + 2u].xyz * u.k, P[b + 2u].w);
+        P[b + 3u] = vec4f(P[b + 3u].xyz * u.k, P[b + 3u].w);
+        P[b + 4u] = vec4f(P[b + 4u].xyz * u.k, P[b + 4u].w);`,
+    });
     this.gridK = ctx.kernel({
       ...common, name: 'mpm-grid',
       buffers: { grid: { type: 'vec4i' }, COL: { type: 'vec4f', access: 'read' } },
@@ -4595,6 +5073,7 @@ class MPM {
   // ------------------------------------------------------------------ stepping
   /** Advance by one frame (1/60 s x timeScale), split into `substeps`. */
   step() {
+    if (this.destroyed) throw new SIError('MPM.step: it was destroyed');
     if (this.count === 0) return;
     const ctx = this.ctx;
     this._uploadColliders();
@@ -4663,7 +5142,8 @@ class MPM {
     return {
       surface: fs,
       set(v) { fs.set(v); return this; },
-      afterScene(view) { fs.set({ matMask: sim.fluidMask() }); fs.afterScene(view); },
+      afterScene(view) { if (sim.destroyed) return; fs.set({ matMask: sim.fluidMask() }); fs.afterScene(view); },
+      destroy() { fs.destroy(); },
     };
   }
 
@@ -4680,11 +5160,14 @@ class MPM {
       spheres: sp,
       set(v) { sp.set(v); return this; },
       draw(pass, view) {
+        if (sim.destroyed) return;
         if (!opts.palette) sim.palette().forEach((c, k) => sp.program.set({ ['pal' + k]: [...c, 1] }));
         sp.program.set({ matMask: opts.solidsOnly ? ~sim.fluidMask() >>> 0 : 0xffffffff });
+        sp.program.set({ velScale: sim.dx / sim.substepDt });   // substeps / timeScale may have changed
         sp.program.bind({ P: sim.P });
         sp.draw(pass, view);
       },
+      destroy() { sp.destroy(); },
     };
   }
 }
@@ -4722,11 +5205,13 @@ function sampleShape(shape, spacing, jitter, seed) {
       }
   return new Float32Array(out);
 }
-return { FLUID, MATERIALS, MPM };
+return { FLUID, JELLY, SNOW, SAND, MPM_KINDS, MATERIALS, MPM };
 })();
 
 // ---- src/physics/nbody.js
-const __m25 = (() => {
+const __m27 = (() => {
+const destroyAll = __m9.destroyAll;
+const SIError = __m4.SIError;
 // Direct-summation N-body gravity, O(N^2), tuned to run near the ALU roofline.
 //
 // One interaction is ~20 flops (3 sub, 3 fma for r^2, rsqrt, 2 mul, 3 fma) on
@@ -4740,6 +5225,8 @@ const __m25 = (() => {
 //              lane by lane (no shared memory, no barriers) — needs a fixed
 //              subgroup size, e.g. 32 on Apple GPUs.
 // Integration: symplectic Euler (kick-drift), double-buffered positions.
+
+
 
 const VARIANTS = (caps) => {
   const v = [{ mode: 'naive', wg: 256, K: 1 }];
@@ -4770,6 +5257,12 @@ class NBody {
     this.vel = ctx.array('vec4f', this.count, { label: 'nbody-vel' });
     this.kernels = new Map();
     this.variant = o.variant || { mode: 'tiled', wg: 256, K: 2 };
+  }
+
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    destroyAll(this.pos, this.pos2, this.vel);
   }
 
   static variants(caps) { return VARIANTS(caps); }
@@ -4833,11 +5326,13 @@ ${all('          ')}
 
   /** Advance `steps` steps. */
   step(steps = 1, variant = this.variant) {
+    if (this.destroyed) throw new SIError('NBody.step: it was destroyed');
     const k = this.kernel(variant);
     const groups = Math.ceil(this.count / k.bodiesPerGroup);
     this.ctx.region('nbody', () => {
       for (let s = 0; s < steps; s++) {
-        k.dispatch(groups, { n: this.count, eps2: this.softening ** 2, G: this.G, dt: this.dt },
+        // eps2 > 0: a body's interaction with itself would be 0 · ∞ otherwise (softening 0)
+        k.dispatch(groups, { n: this.count, eps2: Math.max(this.softening ** 2, 1e-20), G: this.G, dt: this.dt },
           { pos: this.pos, posOut: this.pos2, vel: this.vel });
         [this.pos, this.pos2] = [this.pos2, this.pos];
       }
@@ -4850,19 +5345,35 @@ ${all('          ')}
    */
   async autotune({ reps = 4, cache = true } = {}) {
     const caps = this.ctx.caps;
-    const key = `si-nbody-v1-${caps.vendor}-${caps.architecture}-${Math.round(Math.log2(this.count))}`;
+    // the variants on offer depend on subgroup support (init({ subgroups: false }) removes some)
+    const key = `si-nbody-v2-${caps.vendor}-${caps.architecture}-sg${+caps.subgroups}-${Math.round(Math.log2(this.count))}`;
+    const offered = VARIANTS(caps);
+    const same = (a, b) => a && b && a.mode === b.mode && a.wg === b.wg && a.K === b.K;
     if (cache && typeof localStorage !== 'undefined') {
-      try { const c = JSON.parse(localStorage.getItem(key)); if (c) { this.variant = c.variant; return c.results; } } catch {}
+      try {
+        const c = JSON.parse(localStorage.getItem(key));
+        if (c && offered.some((v) => same(v, c.variant))) { this.variant = offered.find((v) => same(v, c.variant)); return c.results; }
+      } catch { /* a corrupt cache entry is re-measured */ }
     }
+    // timing steps the simulation: keep its state and put it back afterwards
+    const savedPos = this.ctx.array('vec4f', this.count, { label: 'nbody-autotune-pos' });
+    const savedVel = this.ctx.array('vec4f', this.count, { label: 'nbody-autotune-vel' });
+    this.ctx.copy(this.pos, savedPos); this.ctx.copy(this.vel, savedVel);
     const results = [];
     const n2 = this.count * this.count;
-    for (const v of VARIANTS(caps)) {
-      const k = this.kernel(v);
-      try { await k.ready(); } catch { continue; }
-      // choose a batch so each measurement is ~20 ms of GPU work
-      const ms = await timeIt(this.ctx, () => this.step(1, v), reps, n2);
-      results.push({ variant: v, ms, gips: n2 / (ms * 1e6) });
+    try {
+      for (const v of offered) {
+        const k = this.kernel(v);
+        try { await k.ready(); } catch { continue; }
+        // choose a batch so each measurement is ~20 ms of GPU work
+        const ms = await timeIt(this.ctx, () => this.step(1, v), reps, n2);
+        results.push({ variant: v, ms, gips: n2 / (ms * 1e6) });
+      }
+    } finally {
+      this.ctx.copy(savedPos, this.pos); this.ctx.copy(savedVel, this.vel);
+      savedPos.destroy(); savedVel.destroy();
     }
+    if (!results.length) throw new SIError('NBody.autotune: no kernel variant compiled on this device');
     results.sort((a, b) => a.ms - b.ms);
     this.variant = results[0].variant;
     if (cache && typeof localStorage !== 'undefined') localStorage.setItem(key, JSON.stringify({ variant: this.variant, results }));
@@ -4909,6 +5420,7 @@ ${all('          ')}
         vel.set([g.v[0] + vx, g.v[1] + vy, g.v[2] + vz, 0], 4 * k);
       }
     }
+    this.ctx.flush();   // recorded steps swap pos/pos2 when they run: submit them before re-initialising
     this.pos.write(pos); this.vel.write(vel);
     return this;
   }
@@ -4927,6 +5439,7 @@ ${all('          ')}
       pos.set([d[0] * r, d[1] * r, d[2] * r, 1 / n], 4 * k);
       vel.set([dv[0] * v, dv[1] * v, dv[2] * v, 0], 4 * k);
     }
+    this.ctx.flush();   // recorded steps swap pos/pos2 when they run: submit them before re-initialising
     this.pos.write(pos); this.vel.write(vel);
     return this;
   }
@@ -4974,8 +5487,8 @@ return { NBody, timeIt };
 })();
 
 // ---- src/render/points.js
-const __m26 = (() => {
-const RenderProgram = __m11.RenderProgram;
+const __m28 = (() => {
+const RenderProgram = __m13.RenderProgram;
 // Additive glow sprites for very large particle counts (galaxies, sparks,
 // curl-noise flows). Each particle is a camera-facing quad with a Gaussian
 // falloff, blended additively into the HDR target (no depth write), so millions
@@ -5031,14 +5544,18 @@ class Points {
   set(v) { this.program.set(v); return this; }
   bind(r) { this.program.bind(r); return this; }
   get count() { const c = this.o.count; return typeof c === 'function' ? c() : c ?? this.o.data.length; }
-  draw(pass, view) { const n = this.count; if (n > 0) this.program.draw(pass, view, 4, n); }
+  draw(pass, view) { if (this.o.data?.destroyed) return; const n = this.count; if (n > 0) this.program.draw(pass, view, 4, n); }
+  /** Layers own no GPU memory beyond their pipeline (garbage-collected); kept for a uniform API. */
+  destroy() { this.destroyed = true; }
 }
 return { Points };
 })();
 
 // ---- src/render/sdf.js
-const __m27 = (() => {
-const RenderProgram = __m11.RenderProgram;
+const __m29 = (() => {
+const RenderProgram = __m13.RenderProgram;
+const destroyAll = __m9.destroyAll;
+const SIError = __m4.SIError;
 // SdfScene: render a signed-distance-field scene by writing only `map()`.
 //
 //   view.add(gpu.sdf({
@@ -5056,6 +5573,8 @@ const RenderProgram = __m11.RenderProgram;
 //   2. fragment: per-pixel sphere tracing from that distance, then normal, soft
 //      shadow, ambient occlusion and PBR shading; writes depth so rasterised
 //      layers (particles, meshes) intersect the SDF scene correctly.
+
+
 
 
 const MATERIAL_WGSL = /* wgsl */`
@@ -5149,7 +5668,25 @@ class SdfScene {
     this.tw = 0; this.th = 0;
   }
 
-  set(values) { Object.assign(this.values, values); return this; }
+  /**
+   * Update values: your uniforms, plus shadows, ao (booleans), maxDistance, sun, sunRadiance, fog.
+   * Unknown names throw here rather than in the middle of a frame.
+   */
+  set(values) {
+    const v = { ...values };
+    if ('maxDistance' in v) { v.maxDist = v.maxDistance; delete v.maxDistance; }
+    if ('shadows' in v) v.shadows = +v.shadows;
+    if ('ao' in v) v.ao = +v.ao;
+    if (v.sun) v.sun = norm(v.sun);
+    if ('tile' in v) {
+      if (v.tile !== this.tile) throw new SIError('SdfScene.set: the tile size is fixed when the scene is created', 'invalid-argument');
+      delete v.tile;
+    }
+    for (const k of Object.keys(v))
+      if (!this.program.fieldByName.has(k)) throw new SIError(`SdfScene.set: unknown value "${k}" (declare it in uniforms)`, 'invalid-argument');
+    Object.assign(this.values, v);
+    return this;
+  }
 
   prepare(view) {
     const T = this.tile;
@@ -5169,6 +5706,7 @@ class SdfScene {
   draw(pass, view) {
     this.program.draw(pass, view, 3, 1, { ...this.values, tilesX: this.tw, time: view.time }, { tsafe: this.tsafe });
   }
+  destroy() { this.destroyed = true; destroyAll(this.tsafe); this.tsafe = null; this.tw = this.th = 0; }
 }
 
 function norm(v) { const l = Math.hypot(...v) || 1; return v.map((x) => x / l); }
@@ -5176,8 +5714,8 @@ return { SdfScene };
 })();
 
 // ---- src/render/glyphs.js
-const __m28 = (() => {
-const RenderProgram = __m11.RenderProgram;
+const __m30 = (() => {
+const RenderProgram = __m13.RenderProgram;
 // Oriented instanced glyphs (arrows / fish / darts) for agents: each instance
 // is a tiny tetrahedral dart aligned with its velocity, lit with the PBR module.
 // 12 vertices per instance (4 triangles), generated in the vertex shader.
@@ -5225,19 +5763,28 @@ class Glyphs {
   }
   set(v) { this.program.set(v); return this; }
   get count() { const c = this.o.count; return typeof c === 'function' ? c() : c ?? this.o.pos.length; }
-  draw(pass, view) { this.program.draw(pass, view, 12, this.count, null, { P: this.o.pos, V: this.o.vel }); }
+  draw(pass, view) {
+    if (this.o.pos.destroyed || this.o.vel.destroyed) return;
+    this.program.draw(pass, view, 12, this.count, null, { P: this.o.pos, V: this.o.vel });
+  }
+  /** Layers own no GPU memory beyond their pipeline (garbage-collected); kept for a uniform API. */
+  destroy() { this.destroyed = true; }
 }
 return { Glyphs };
 })();
 
 // ---- src/physics/boids.js
-const __m29 = (() => {
-const SpatialGrid = __m9.SpatialGrid;
+const __m31 = (() => {
+const SpatialGrid = __m11.SpatialGrid;
+const destroyAll = __m9.destroyAll;
+const SIError = __m4.SIError;
 // Boids (Reynolds 1987) at scale: separation, alignment and cohesion over a
 // fixed perception radius, with neighbours found through the counting-sort
 // uniform grid. Every frame the agents are re-ordered into cell order, so the
 // neighbour loop reads contiguous memory (the arrays stay permuted — boids have
 // no identity, so no index map is needed).
+
+
 
 
 class Boids {
@@ -5306,6 +5853,12 @@ class Boids {
     });
   }
 
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    destroyAll(this.pos, this.vel, this.sPos, this.sVel, this.grid);
+  }
+
   /** Scatter boids uniformly in the cube with random velocities. */
   randomize(seed = 1) {
     let s = seed >>> 0 || 1;
@@ -5316,11 +5869,20 @@ class Boids {
       const z = rnd() * 2 - 1, a = rnd() * 6.283, r = Math.sqrt(1 - z * z), sp = this.params.minSpeed;
       v.set([r * Math.cos(a) * sp, r * Math.sin(a) * sp, z * sp, 0], 4 * k);
     }
+    this.ctx.flush();   // must not overtake steps that are recorded but not yet submitted
     this.pos.write(p); this.vel.write(v);
     return this;
   }
 
   step(dt = 1 / 60) {
+    if (this.destroyed) throw new SIError('Boids.step: it was destroyed');
+    if (!(dt > 0)) return;
+    // the neighbour grid's cells are sized for the perception radius: rebuild it when that changes
+    if (Math.abs(this.grid.cellSize - this.params.radius) > 1e-9) {
+      const h = this.half;
+      this.grid.destroy();
+      this.grid = new SpatialGrid(this.ctx, { maxCount: this.count, min: [-h, -h, -h], max: [h, h, h], cellSize: this.params.radius });
+    }
     const P = this.params, g = this.grid;
     this.ctx.region('boids', () => {
       g.build(this.pos, this.count);
@@ -5338,7 +5900,9 @@ return { Boids };
 })();
 
 // ---- src/physics/cloth.js
-const __m30 = (() => {
+const __m32 = (() => {
+const destroyAll = __m9.destroyAll;
+const SIError = __m4.SIError;
 // XPBD cloth (Macklin, Müller & Chentanez 2016) with "small steps" (Macklin et
 // al. 2019): many substeps with a single constraint iteration each, which
 // converges faster than many iterations of one big step and makes the
@@ -5358,6 +5922,8 @@ const __m30 = (() => {
 // Gauss–Seidel spreads a load only a few edges per substep, so a hanging sheet
 // would otherwise sag/stretch under its own weight; one extra dispatch fixes it.
 
+
+
 const FAMILIES = [
   // [dx, dy, kind] kind: 0 stretch, 1 shear, 2 bend
   [1, 0, 0], [0, 1, 0], [1, 1, 1], [-1, 1, 1], [2, 0, 2], [0, 2, 2],
@@ -5372,6 +5938,7 @@ class Cloth {
   constructor(ctx, o = {}) {
     this.ctx = ctx;
     const W = (this.W = o.width || 128), H = (this.H = o.height || 128);
+    if (!(W >= 2 && H >= 2)) throw new SIError(`Cloth: width and height must be at least 2 particles (got ${W} × ${H})`, 'invalid-argument');
     this.count = W * H;
     this.size = o.size || [1.6, 1.6];
     this.origin = o.origin || [-0.8, 1.6, 0];
@@ -5427,6 +5994,7 @@ class Cloth {
         const z = vertical ? this.origin[2] + 0.002 * Math.sin(i * 0.7) : this.origin[2] + (j / (H - 1)) * this.size[1] - this.size[1] / 2;
         p.set([x, y, z, pinFn(i, j) ? 0 : 1], 4 * k);
       }
+    this.ctx.flush();   // a reset must not overtake steps that are recorded but not yet submitted
     this.pos.write(p); this.prev.write(p);
     this.ctx.clear(this.vel);
     // tethers: nearest pinned particle and its rest distance (static pins)
@@ -5445,6 +6013,13 @@ class Cloth {
     this.tether.write(teth);
     this.restX = this.size[0] / (W - 1);
     this.restY = this.size[1] / (H - 1);
+  }
+
+  /** Free the cloth's GPU buffers. */
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    destroyAll(this.pos, this.prev, this.vel, this.nrm, this.colBuf, this.tether, this.indices);
   }
 
   _kernels() {
@@ -5544,7 +6119,7 @@ class Cloth {
         if (x.y < u.floorY + u.thickness) {
           x.y = u.floorY + u.thickness;
           let dx = x - x0;
-          x.x -= dx.x * u.friction; x.z -= dx.z * u.friction;
+          x.x -= dx.x * min(u.friction, 1.0); x.z -= dx.z * min(u.friction, 1.0);
         }
         pos[i] = vec4f(x, p.w);
         vel[i] = vec4f((x - x0) / u.dt, 0.0);`,
@@ -5580,11 +6155,13 @@ class Cloth {
       if (c.type === 'box') data.set([...c.center, 0, ...(c.half || [0.1, 0.1, 0.1]), 1], k * 8);
       else data.set([...c.center, c.radius ?? 0.2, 0, 0, 0, 0], k * 8);
     });
-    this.colBuf.write(data);
+    this.colBuf.writeOrdered(data);   // ordered: several step() calls in one batch each see their own colliders
   }
 
   /** Advance one frame of `frameDt` seconds. */
   step(frameDt = 1 / 60) {
+    if (this.destroyed) throw new SIError('Cloth.step: it was destroyed');
+    if (!(frameDt > 0)) return;   // a zero time step would divide by zero in the velocity update
     const ctx = this.ctx, W = this.W, H = this.H;
     this._uploadColliders();
     const dt = Math.min(frameDt, 1 / 30) / this.substeps;
@@ -5618,8 +6195,8 @@ return { Cloth };
 })();
 
 // ---- src/render/mesh.js
-const __m31 = (() => {
-const RenderProgram = __m11.RenderProgram;
+const __m33 = (() => {
+const RenderProgram = __m13.RenderProgram;
 // Surface mesh whose vertices live in GPU storage buffers (positions + normals
 // written by a simulation), drawn with an index buffer. Two-sided PBR shading
 // with separate front/back colours and an optional grid pattern from (W, H).
@@ -5666,14 +6243,19 @@ class SurfaceMesh {
   }
   set(v) { this.program.set(v); return this; }
   draw(pass, view) {
+    if (this.o.pos.destroyed || this.o.nrm.destroyed) return;
     this.program.drawIndexed(pass, view, this.o.indices, this.o.indexCount, 1, null, { P: this.o.pos, N: this.o.nrm });
   }
+  /** Layers own no GPU memory beyond their pipeline (garbage-collected); kept for a uniform API. */
+  destroy() { this.destroyed = true; }
 }
 return { SurfaceMesh };
 })();
 
 // ---- src/physics/smoke.js
-const __m32 = (() => {
+const __m34 = (() => {
+const destroyAll = __m9.destroyAll;
+const SIError = __m4.SIError;
 // Eulerian smoke / fire on a staggered MAC grid (Harlow & Welch 1965; Stam
 // 1999; Fedkiw, Stam & Jensen 2001; Bridson, "Fluid Simulation for Computer
 // Graphics").
@@ -5690,6 +6272,8 @@ const __m32 = (() => {
 //   scal texel (i,j,k) = (density, temperature) at the cell centre
 // Per step: advect faces and scalars (semi-Lagrangian) -> forces (vorticity
 // confinement, buoyancy, sources) -> divergence -> red–black SOR -> projection.
+
+
 
 class Smoke {
   constructor(ctx, o = {}) {
@@ -5722,6 +6306,13 @@ class Smoke {
     this.pressure = tex('r32float', 'smoke-p');
     this.srcBuf = ctx.array('vec4f', 8 * 3, { label: 'smoke-sources' });
     this._kernels();
+  }
+
+  /** Free the simulation's 3D textures and buffers. */
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    destroyAll(this.velA, this.velB, this.scalA, this.scalB, this.curl, this.div, this.pressure, this.srcBuf);
   }
 
   _kernels() {
@@ -5879,11 +6470,12 @@ class Smoke {
     this.sources.slice(0, 8).forEach((s, k) => {
       d.set([...s.center, s.radius ?? 0.1, s.density ?? 2, s.temperature ?? 1, 0, 0, ...(s.velocity || [0, 0, 0]), 0], k * 12);
     });
-    this.srcBuf.write(d);
+    this.srcBuf.writeOrdered(d);   // ordered: several step() calls in one batch each see their own sources
   }
 
   /** Clear all fields. */
   reset() {
+    this.ctx.flush();   // the texture writes below must not overtake recorded steps
     for (const t of [this.velA, this.velB, this.scalA, this.scalB, this.curl, this.div, this.pressure]) {
       const bytes = t.format === 'r32float' ? 4 : 8;
       const zero = new Uint8Array(t.width * t.height * bytes);
@@ -5893,6 +6485,8 @@ class Smoke {
   }
 
   step(dt = 1 / 60) {
+    if (this.destroyed) throw new SIError('Smoke.step: it was destroyed');
+    if (!(dt > 0)) return;
     dt = Math.min(dt, 1 / 30);
     this.time += dt;
     this._uploadSources();
@@ -5920,8 +6514,10 @@ return { Smoke };
 })();
 
 // ---- src/render/volume.js
-const __m33 = (() => {
-const RenderProgram = __m11.RenderProgram;
+const __m35 = (() => {
+const RenderProgram = __m13.RenderProgram;
+const destroyAll = __m9.destroyAll;
+const SIError = __m4.SIError;
 // Volumetric renderer for a 3D density/temperature texture (the Smoke solver's
 // scalar field). Single scattering with precomputed light transmittance:
 //   1. compute: for every voxel march toward the sun -> transmittance texture
@@ -5931,8 +6527,10 @@ const RenderProgram = __m11.RenderProgram;
 // Composited over the HDR scene with premultiplied alpha after the opaque pass.
 
 
+
+
 class Volume {
-  /** o: smoke (Smoke instance), density, absorption, emission, sun, sunColor, ambient, steps */
+  /** o: smoke (Smoke instance), density, emission, tint, sun, sunColor, ambient, g (Henyey–Greenstein anisotropy) */
   constructor(ctx, o) {
     this.ctx = ctx;
     this.smoke = o.smoke;
@@ -6019,9 +6617,16 @@ class Volume {
     });
   }
 
-  set(v) { Object.assign(this.values, v); return this; }
+  /** Update density, emission, tint, sun, sunColor, ambient or g; unknown names throw. */
+  set(v) {
+    for (const k of Object.keys(v))
+      if (!(k in this.values)) throw new SIError(`Volume.set: unknown value "${k}" (use ${Object.keys(this.values).join(', ')})`, 'invalid-argument');
+    Object.assign(this.values, v, v.sun ? { sun: norm(v.sun) } : {});
+    return this;
+  }
 
   prepare() {
+    if (this.destroyed || this.smoke.destroyed) return;
     const s = this.smoke, D = s.dims;
     const step = 1.0; // one voxel per light step (in voxel units)
     const sunT = this.values.sun.map((c, a) => (c * step) / D[a]);
@@ -6029,6 +6634,7 @@ class Volume {
   }
 
   afterScene(view) {
+    if (this.destroyed || this.smoke.destroyed) return;
     const s = this.smoke;
     const pass = this.ctx.renderPass({ colorAttachments: [{ view: view.hdr.view, loadOp: 'load', storeOp: 'store' }] });
     this.program.draw(pass, view, 3, 1, {
@@ -6036,6 +6642,7 @@ class Volume {
     }, { scal: s.scalA, lightT: this.light, depthTex: view.depth });
     pass.end();
   }
+  destroy() { this.destroyed = true; destroyAll(this.light); }
 }
 
 function norm(v) { const l = Math.hypot(...v) || 1; return v.map((x) => x / l); }
@@ -6043,18 +6650,20 @@ return { Volume };
 })();
 
 // ---- src/physics/rigid.js
-const __m34 = (() => {
-const SpatialGrid = __m9.SpatialGrid;
-const Scan = __m7.Scan;
-const BODY_VEC4 = __m21.BODY_VEC4;
-const CONTACT_VEC4 = __m21.CONTACT_VEC4;
-const JOINT_VEC4 = __m21.JOINT_VEC4;
-const SHAPES = __m21.SHAPES;
-const FLAGS = __m21.FLAGS;
-const JOINT_TYPES = __m21.JOINT_TYPES;
-const JOINT_FLAGS = __m21.JOINT_FLAGS;
-const NARROW_WGSL = __m21.NARROW_WGSL;
-const RAY_WGSL = __m21.RAY_WGSL;
+const __m36 = (() => {
+const SpatialGrid = __m11.SpatialGrid;
+const Scan = __m8.Scan;
+const BODY_VEC4 = __m23.BODY_VEC4;
+const CONTACT_VEC4 = __m23.CONTACT_VEC4;
+const JOINT_VEC4 = __m23.JOINT_VEC4;
+const SHAPES = __m23.SHAPES;
+const FLAGS = __m23.FLAGS;
+const JOINT_TYPES = __m23.JOINT_TYPES;
+const JOINT_FLAGS = __m23.JOINT_FLAGS;
+const NARROW_WGSL = __m23.NARROW_WGSL;
+const RAY_WGSL = __m23.RAY_WGSL;
+const SIError = __m4.SIError;
+const destroyAll = __m9.destroyAll;
 // Rigid bodies with Augmented Vertex Block Descent (Giles, Diaz & Yuksel,
 // SIGGRAPH 2025), building on Vertex Block Descent (Chen et al., 2024).
 //
@@ -6096,8 +6705,10 @@ const RAY_WGSL = __m21.RAY_WGSL;
 
 
 
+
+
 const MAX_COLORS = 16;
-const COLOR_ROUNDS = 20;
+const COLOR_ROUNDS = 20;   // Jones–Plassmann rounds per step (the verify checker reads the final buffer)
 const MAX_LARGE = 256;    // bodies too big for the broadphase grid, tested against everything
 const LANES = 8;          // threads per body in the primal step
 const BODIES_PER_WG = 64 / LANES;
@@ -6113,6 +6724,8 @@ const reverseList = (NB, b) => /* wgsl */`
   let rn = min(rw & 0xffffu, select(${MAXR}u, ${MAXRL}u, rw > 0xffffu));
   let rb = select(${b} * ${MAXR}u, ${NB * (MAXR + 1)}u + ((rw >> 16u) - 1u) * ${MAXRL}u, rw > 0xffffu);`;
 const NONE = 0xffffffff;
+const STORAGE_BUFFERS_NEEDED = 10;       // rigid-reverse-large binds 10
+const FUSED_WORKGROUP_BYTES = 128 * 9 * 16 + 4;   // the fused solve's reduction array (128 lanes × 9 vec4f) + a counter
 const CMD = { pose: 1, velocity: 2, impulse: 3, flags: 4, filter: 5, kinematic: 6, motor: 7, jointFlags: 8, limits: 9, props: 10 };
 
 // Reads only the members of a body a constraint needs (spliced into kernels that bind B).
@@ -6136,6 +6749,11 @@ class RigidWorld {
    */
   constructor(ctx, o = {}) {
     this.ctx = ctx;
+    // the solver binds up to 10 storage buffers in one kernel (the WebGPU default limit is 8; init()
+    // requests the adapter's maximum, which is 10 or more on ~98% of devices)
+    const sb = ctx.limits.maxStorageBuffersPerShaderStage;
+    if (sb < STORAGE_BUFFERS_NEEDED)
+      throw new SIError(`RigidWorld needs ${STORAGE_BUFFERS_NEEDED} storage buffers per shader stage; this device allows ${sb}`, 'unsupported');
     this.maxBodies = Math.min(o.maxBodies || 16384, 65535);
     this.maxContacts = o.maxContacts || this.maxBodies * 16;
     this.maxPairs = o.maxPairs || this.maxBodies * 8;
@@ -6278,8 +6896,9 @@ class RigidWorld {
     return id;
   }
 
-  /** Remove a body (its slot is reused by later adds; joints attached to it are disabled). */
+  /** Remove a body (its slot is reused by later adds; joints attached to it are disabled). Removing twice is a no-op. */
   remove(id) {
+    if (!(id >= 0 && id < this.count) || this.free.includes(id)) return;
     this._cmd(CMD.flags, id, null, null, 0, FLAGS.disabled);
     this.free.push(id);
     this.joints.forEach((j, k) => { if (j.a === id || j.b === id) this.setJointEnabled(k, false); });
@@ -6287,6 +6906,11 @@ class RigidWorld {
 
   // ------------------------------------------------------------------ commands (applied in order, on the GPU)
   _cmd(type, id, a, c, hz = 0, hw = 0) {
+    // an invalid id would be clamped by the GPU onto another body or joint: refuse it here
+    const joint = type >= CMD.motor && type <= CMD.limits;
+    const n = joint ? this.joints.length : this.count;
+    if (!Number.isInteger(id) || id < 0 || id >= n)
+      throw new SIError(`RigidWorld: no ${joint ? 'joint' : 'body'} ${id} (${n} exist${id === -1 ? '; -1 is what add* returns when the world is full' : ''})`, 'invalid-argument');
     this.cmds.push({ type, id, a: a || [0, 0, 0, 0], c: c || [0, 0, 0, 0], hz, hw });
   }
   /** Teleport a body. */
@@ -6326,8 +6950,11 @@ class RigidWorld {
     const k = this.joints.length;
     if (k >= this.maxJoints) return -1;
     const type = JOINT_TYPES[o.type || 'ball'];
-    if (type === undefined) throw new Error(`RigidWorld: unknown joint type ${o.type}`);
+    if (type === undefined) throw new SIError(`RigidWorld.addJoint: unknown joint type "${o.type}" (use ${Object.keys(JOINT_TYPES).join(' | ')})`, 'invalid-argument');
     const a = o.a, b = o.b === undefined || o.b === null || o.b < 0 ? NONE : o.b;
+    const valid = (id) => Number.isInteger(id) && id >= 0 && id < this.count && !this.free.includes(id);
+    if (!valid(a) || (b !== NONE && !valid(b)))
+      throw new SIError(`RigidWorld.addJoint: body ${valid(a) ? b : a} does not exist`, 'invalid-argument');
     const pa = this.cpu[a] ? [...this.cpu[a].subarray(0, 3)] : [0, 0, 0];
     const anchor = o.anchor || (b === NONE ? pa : [...this.cpu[b].subarray(0, 3)]);
     const anchorB = o.anchorB || anchor;
@@ -6347,14 +6974,26 @@ class RigidWorld {
     rec.set([axis[0] / al, axis[1] / al, axis[2] / al, o.limits ? o.limits[0] : 0], 16);
     rec.set([axis[0] / al, axis[1] / al, axis[2] / al, o.limits ? o.limits[1] : 0], 20);
     rec.set([o.stiffness ?? 0, o.damping ?? 0, o.motor?.speed ?? 0, o.motor?.maxForce ?? 0], 24);
-    this.joints.push({ a, b, type, flags, rec, enabled: true });
+    this.joints.push({ a, b, type, flags, rec, enabled: true, motorMax: o.motor?.maxForce ?? 0 });
     this.jointsDirty = true;
     this._pending = true;
     return k;
   }
-  /** Motor target speed (rad/s or m/s) and force/torque limit; speed null turns the motor off. */
-  setMotor(j, speed, maxForce) { this._cmd(CMD.motor, j, [speed ?? 0, maxForce ?? 0, speed === null ? 0 : 1, 0]); }
-  setLimits(j, lo, hi) { this._cmd(CMD.limits, j, [lo ?? 0, hi ?? 0, lo === null ? 0 : 1, 0]); }
+  /**
+   * Motor target speed (rad/s or m/s) and force/torque limit (default: the joint's current limit);
+   * speed null turns the motor off.
+   */
+  setMotor(j, speed, maxForce) {
+    const jt = this.joints[j];
+    if (jt && maxForce !== undefined) jt.motorMax = maxForce;
+    this._cmd(CMD.motor, j, [speed ?? 0, maxForce ?? jt?.motorMax ?? 0, speed === null ? 0 : 1, 0]);
+  }
+  /** Limits [lo, hi] (rad or m); setLimits(j, null) removes them. */
+  setLimits(j, lo, hi) {
+    if (lo !== null && !(Number.isFinite(lo) && Number.isFinite(hi) && lo <= hi))
+      throw new SIError(`RigidWorld.setLimits: need lo ≤ hi (got ${lo}, ${hi}); pass null to remove the limits`, 'invalid-argument');
+    this._cmd(CMD.limits, j, [lo ?? 0, hi ?? 0, lo === null ? 0 : 1, 0]);
+  }
   setJointEnabled(j, on) {
     this._cmd(CMD.jointFlags, j, null, null, on ? JOINT_FLAGS.disabled : 0, on ? 0 : JOINT_FLAGS.disabled);
     if (this.joints[j]) this.joints[j].enabled = on;
@@ -6423,6 +7062,7 @@ class RigidWorld {
     const volume = (hi[0] - lo[0]) * (hi[1] - lo[1]) * (hi[2] - lo[2]);
     const cell = Math.max(0.05, 2 * this.rSmall + this.margin, 1.01 * Math.cbrt(volume / (1 << 22)));
     if (!this.grid || Math.abs(this.grid.cellSize - cell) > 1e-6) {
+      this.grid?.destroy();   // its last uses were submitted by the flush above
       this.grid = new SpatialGrid(this.ctx, { maxCount: this.maxBodies, min: this.bounds[0], max: this.bounds[1], cellSize: cell });
       this._gridKernels();
     }
@@ -6717,8 +7357,11 @@ class RigidWorld {
        for (var gi = i; gi < counter[3]; gi += nwg.x * nwg.y * WG) {
         let i = gi;   // the pair this iteration writes (grid-stride: any dispatch size covers all pairs)
         let base = coffset[i];
-        let n = coffset[i + 1u] - base;
-        if (n == 0u || base + n > u.maxContacts) { continue; }
+        let nAll = coffset[i + 1u] - base;
+        if (nAll == 0u || base >= u.maxContacts) { continue; }
+        // a pair straddling maxContacts keeps the points that fit: readers stop at maxContacts, so
+        // skipping it would leave stale contacts from an earlier step in the slots they still read
+        let n = min(nAll, u.maxContacts - base);
         let pr = pairs[i];
         let a = pr.x; let b = pr.y;
         let A = B[a];
@@ -7330,6 +7973,8 @@ class RigidWorld {
 
   // ------------------------------------------------------------------ stepping
   step(frameDt = 1 / 60) {
+    if (this.destroyed) throw new SIError('RigidWorld.step: the world was destroyed');
+    if (!(frameDt > 0)) return;   // a zero or invalid time step would divide by zero on the GPU
     this.commit();
     if (!this.count) { this.cmds = []; return; }
     const ctx = this.ctx, n = this.count;
@@ -7348,10 +7993,11 @@ class RigidWorld {
       maxPairs: this.maxPairs,
     };
     const gridBufs = { B: this.B, order: this.grid.order, start: this.grid.start, large: this.large, jset: this.jset, J: this.J };
+    ctx.clear(this.cnts);   // once per step: the event counter accumulates over the substeps (the other slots are rewritten each substep)
     for (let s = 0; s < this.substeps; s++) {
       const cur = this.frame & 1, prev = cur ^ 1;
       ctx.region('rigid: broadphase', () => {
-        ctx.clear(this.cnts); ctx.clear(this.tbl[cur]); ctx.clear(this.ccount);
+        ctx.clear(this.tbl[cur]); ctx.clear(this.ccount);
         this.predictK.run(n, { dt, g: this.gravity }, { B: this.B, centers: this.centers, ext: this.ext });
         if (nj) this.jointPrepK.run(nj, { gammaLam, gammaK: this.gamma, kStart: this.kStartJoint, ih2, massFloor: this.jointMassFloor }, { B: this.B, J: this.J });
         this.grid.build(this.centers, n);
@@ -7458,7 +8104,7 @@ class RigidWorld {
   _useFused(n) {
     const on = this.fusedSolve;
     if (on === false) return false;
-    if (this.ctx.limits.maxStorageBuffersPerShaderStage < 9) return false;
+    if (this.ctx.limits.maxComputeWorkgroupStorageSize < FUSED_WORKGROUP_BYTES) return false;   // ~1% of devices (16 KB)
     return on === true || n <= on;
   }
 
@@ -7477,6 +8123,7 @@ class RigidWorld {
 
   /** Body poses: Float32Array of [x, y, z, qx, qy, qz, qw] per body. */
   async readPoses() {
+    if (!this.count) return new Float32Array(0);
     const raw = await this.B.read(this.count * BODY_VEC4);
     const out = new Float32Array(this.count * 7);
     for (let k = 0; k < this.count; k++) {
@@ -7488,6 +8135,8 @@ class RigidWorld {
 
   /** Full body state: { position, rotation, velocity, angularVelocity, flags } typed arrays. */
   async readBodies() {
+    if (!this.count) return { position: new Float32Array(0), rotation: new Float32Array(0), velocity: new Float32Array(0),
+      angularVelocity: new Float32Array(0), flags: new Uint32Array(0) };
     const raw = await this.B.read(this.count * BODY_VEC4);
     const u = new Uint32Array(raw.buffer, raw.byteOffset, raw.length);
     const n = this.count;
@@ -7542,7 +8191,8 @@ class RigidWorld {
 
   /** Cast rays [{ origin, dir, maxDistance, mask }] → [{ hit, body, distance, point, normal }]. */
   async raycast(rays) {
-    if (!this._rq || this._rq.maxRays < rays.length) this._rq = new RayQuery(this, Math.max(64, rays.length));
+    if (!rays.length) return [];
+    if (!this._rq || this._rq.maxRays < rays.length) { this._rq?.destroy(); this._rq = new RayQuery(this, Math.max(64, rays.length)); }
     this._rq.set(rays).run(rays.length);
     return this._rq.read(rays.length);
   }
@@ -7697,6 +8347,18 @@ class RigidWorld {
     if (s.cnt) ctx.copy(s.cnt, this.cnts, 32);   // so an export right after this describes the restored contacts
     this._pending = true;   // re-derive the large-body list for the restored set of bodies
   }
+
+  /** Free every GPU buffer the world allocated (snapshots you took are yours to destroy). Idempotent. */
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.count = 0; this.uploaded = 0;   // anything still pointing at this world (renderers, couplings, ray queries) sees it empty
+    destroyAll(this.B, this.ext, this.centers, this.pcount, this.poffset, this.pairs, this.pscratch, this.rlist, this.ccount, this.coffset,
+      this.C, this.tbl, this.J, this.jcsr, this.jset, this.large, this.color, this.clist, this.info, this.args, this.cnts, this.cmdBuf,
+      this.eventBuf, this.hashBuf, this.pairScan, this.contactScan, this.grid, this._rq);
+    this.grid = null; this._rq = null;
+    this.cpu = []; this.cmds = []; this.forceFields = [];
+  }
 }
 
 /**
@@ -7762,7 +8424,9 @@ class RayQuery {
   /** Record the query for `count` rays (rays may have been written by GPU kernels). */
   run(count = this.maxRays) {
     const w = this.world, ctx = w.ctx;
-    if (!w.count || !count) return this;
+    if (this.destroyed) throw new SIError('RayQuery.run: it was destroyed');
+    if (!count) return this;
+    if (!w.count) { ctx.fillFloat(this.hits, -1); return this; }   // nothing to hit: every ray misses
     ctx.fill(this.best, 0xffffffff);
     const bufs = { B: w.B, rays: this.rays, best: this.best };
     this.testK.run([w.count, count], { phase: 0 }, bufs);
@@ -7770,8 +8434,11 @@ class RayQuery {
     this.resolveK.run(count, { phase: 0 }, { ...bufs, hits: this.hits });
     return this;
   }
+  destroy() { this.destroyed = true; destroyAll(this.rays, this.hits, this.best); }
+
   /** Read hits: [{ hit, body, distance, normal, point }]. */
   async read(count = this.maxRays) {
+    if (!count) return [];
     const h = await this.hits.read(count * 2);
     const r = await this.rays.read(count * 2);
     const u = new Uint32Array(h.buffer, h.byteOffset, h.length);
@@ -7791,12 +8458,12 @@ function eulerQuat([x, y, z]) {
   const cx = Math.cos(x / 2), sx = Math.sin(x / 2), cy = Math.cos(y / 2), sy = Math.sin(y / 2), cz = Math.cos(z / 2), sz = Math.sin(z / 2);
   return [sx * cy * cz - cx * sy * sz, cx * sy * cz + sx * cy * sz, cx * cy * sz - sx * sy * cz, cx * cy * cz + sx * sy * sz];
 }
-return { RIGID_SHAPES: SHAPES, RIGID_FLAGS: FLAGS, JOINT_TYPES, JOINT_FLAGS, RigidWorld, RayQuery, eulerQuat };
+return { RIGID_SHAPES: SHAPES, RIGID_FLAGS: FLAGS, JOINT_TYPES, JOINT_FLAGS, COLOR_ROUNDS, RigidWorld, RayQuery, eulerQuat };
 })();
 
 // ---- src/render/bodies.js
-const __m35 = (() => {
-const RenderProgram = __m11.RenderProgram;
+const __m37 = (() => {
+const RenderProgram = __m13.RenderProgram;
 // Instanced renderer for rigid bodies stored in a RigidWorld body buffer
 // (12 vec4 per body: x at 0, q at 1, size at 8, mass at 9, info at 11). Every body
 // is drawn as its oriented bounding box (36 vertices); boxes shade the faces
@@ -7913,17 +8580,27 @@ class Bodies {
     this.program.set({ sun: sun.map((x) => x / l), staticColor: o.staticColor || [0.25, 0.26, 0.28], saturation: o.saturation ?? 1,
       kinematicColor: o.kinematicColor || [0.55, 0.42, 0.22], groupMask: (o.groups ?? 0xffffffff) >>> 0 });
   }
-  set(v) { this.program.set(v); return this; }
+  /** Update sun, staticColor, kinematicColor, saturation or groups (the visible collision groups). */
+  set(v) {
+    const o = { ...v };
+    if ('groups' in o) { o.groupMask = (o.groups ?? 0xffffffff) >>> 0; delete o.groups; }
+    if (o.sun) { const l = Math.hypot(...o.sun) || 1; o.sun = o.sun.map((x) => x / l); }
+    this.program.set(o);
+    return this;
+  }
   draw(pass, view) {
+    if (this.world.destroyed) return;
     const n = this.world.count;
     if (n) this.program.draw(pass, view, 36, n, null, { P: this.world.B });
   }
+  /** Layers own no GPU memory beyond their pipeline (garbage-collected); kept for a uniform API. */
+  destroy() { this.destroyed = true; }
 }
 return { Bodies };
 })();
 
 // ---- src/nn/gemm.js
-const __m37 = (() => {
+const __m39 = (() => {
 // General matrix multiply on the GPU: C = act(α op(A) op(B) + β C + bias), f32, row-major.
 //
 // Each workgroup computes a BM×BN tile of C. The K dimension is walked in slices of BK:
@@ -7957,7 +8634,7 @@ const GEMM_CONFIGS = [
   { BM: 128, BN: 128, BK: 8, TM: 8, TN: 8 },
 ];
 
-const cache = new Map();
+const cache = new WeakMap();   // per Context: a destroyed context's kernels go with it
 const R = (n) => Array.from({ length: n }, (_, k) => k);
 
 /** The kernel for one (config, transA, transB, activation, bias, beta) combination. */
@@ -8102,36 +8779,45 @@ function reduceKernel(ctx, act, bias, accumulate) {
 
 /** Time every configuration on this device for an n×n×n multiply; remember the fastest (per adapter). */
 async function autotuneGemm(ctx, { n = 2048, reps = 5, cache: useCache = true } = {}) {
-  const id = `si-gemm-${ctx.caps.vendor}-${ctx.caps.architecture}`;
+  // versioned: a cached tile shape is only reused if it is still one of the configurations on offer
+  const id = `si-gemm-v2-${ctx.caps.vendor}-${ctx.caps.architecture}`;
+  const known = (c) => GEMM_CONFIGS.find((g) => c && ['BM', 'BN', 'BK', 'TM', 'TN'].every((k) => g[k] === c[k]) && !!g.prefetch === !!c.prefetch);
   if (useCache && typeof localStorage !== 'undefined') {
-    const hit = localStorage.getItem(id);
-    if (hit) { ctx._gemmCfg = JSON.parse(hit); return { best: ctx._gemmCfg, cached: true }; }
+    try {
+      const hit = known(JSON.parse(localStorage.getItem(id)));
+      if (hit) { ctx._gemmCfg = hit; return { best: hit, cached: true }; }
+    } catch { /* a corrupt cache entry is re-measured */ }
   }
   const A = ctx.array('f32', n * n), B = ctx.array('f32', n * n), C = ctx.array('f32', n * n);
   const results = [];
-  for (const cfg of GEMM_CONFIGS) {
-    const run = () => gemm(ctx, A, B, C, { M: n, N: n, K: n, cfg });
-    run(); await ctx.idle();
-    const t0 = performance.now();
-    for (let r = 0; r < reps; r++) run();
-    await ctx.idle();
-    const ms = (performance.now() - t0) / reps;
-    results.push({ cfg, ms, tflops: (2 * n ** 3) / (ms * 1e9) });
+  try {
+    for (const cfg of GEMM_CONFIGS) {
+      const run = () => gemm(ctx, A, B, C, { M: n, N: n, K: n, cfg });
+      run(); await ctx.idle();
+      const t0 = performance.now();
+      for (let r = 0; r < reps; r++) run();
+      await ctx.idle();
+      const ms = (performance.now() - t0) / reps;
+      results.push({ cfg, ms, tflops: (2 * n ** 3) / (ms * 1e9) });
+    }
+  } finally {
+    A.destroy(); B.destroy(); C.destroy();
   }
   results.sort((a, b) => a.ms - b.ms);
   ctx._gemmCfg = results[0].cfg;
   if (useCache && typeof localStorage !== 'undefined') localStorage.setItem(id, JSON.stringify(results[0].cfg));
-  A.destroy(); B.destroy(); C.destroy();
   return { best: results[0].cfg, results };
 }
 return { ACTIVATIONS, GEMM_CONFIGS, gemmKernel, gemm, autotuneGemm };
 })();
 
 // ---- src/nn/nn.js
-const __m38 = (() => {
-const gemm = __m37.gemm;
-const ACTIVATIONS = __m37.ACTIVATIONS;
-const defineModule = __m5.defineModule;
+const __m40 = (() => {
+const gemm = __m39.gemm;
+const ACTIVATIONS = __m39.ACTIVATIONS;
+const defineModule = __m6.defineModule;
+const SIError = __m4.SIError;
+const destroyAll = __m9.destroyAll;
 // Neural networks on the GPU: dense layers with fused bias + activation (the GEMM epilogue),
 // backpropagation by hand-derived adjoints, Fourier-feature encodings, MSE / softmax
 // cross-entropy losses, SGD and Adam — enough to train MLPs (neural fields, policies,
@@ -8147,7 +8833,10 @@ const defineModule = __m5.defineModule;
 
 
 
-// activation derivative written in terms of the output y (when possible) or the input z
+
+
+// activation derivative written in terms of the output y where possible; the others (sin, gelu)
+// keep their pre-activation z and use ACTIVATIONS[act].df of x = z
 const DERIV_FROM_Y = { none: '1.0', relu: 'select(0.0, 1.0, y > 0.0)', leaky: 'select(0.01, 1.0, y > 0.0)', tanh: '1.0 - y * y', sigmoid: 'y * (1.0 - y)' };
 
 defineModule('nn', {
@@ -8169,7 +8858,7 @@ class Dense {
     this.ctx = ctx;
     this.in = inF; this.out = outF;
     this.act = o.act || 'relu';
-    if (!ACTIVATIONS[this.act]) throw new Error(`Dense: unknown activation ${this.act}`);
+    if (!ACTIVATIONS[this.act]) throw new SIError(`Dense: unknown activation "${this.act}" (use ${Object.keys(ACTIVATIONS).join(', ')})`, 'invalid-argument');
     this.W = ctx.array('f32', inF * outF, { label: 'nn-W' });
     this.b = ctx.array('f32', outF, { label: 'nn-b' });
     this.gW = ctx.array('f32', inF * outF, { label: 'nn-gW' });
@@ -8178,19 +8867,26 @@ class Dense {
   }
   get params() { return [{ w: this.W, g: this.gW }, { w: this.b, g: this.gb }]; }
 
-  /** He / Xavier / SIREN initialisation (uniform), biases zero. */
+  /**
+   * He / Xavier / SIREN initialisation (uniform), biases zero. SIREN (Sitzmann et al. 2020) uses
+   * sin(ω₀ (W x + b)); the forward pass here is sin(W x + b), so ω₀ is folded into the weights:
+   * first layer U(±ω₀ / in), hidden layers U(±√(6 / in)).
+   */
   init(kind, seed, first = false, omega = 30) {
     const n = this.in * this.out;
     let bound;
     if (kind === 'he') bound = Math.sqrt(6 / this.in);
-    else if (kind === 'siren') bound = first ? 1 / this.in : Math.sqrt(6 / this.in) / omega;
+    else if (kind === 'siren') bound = first ? omega / this.in : Math.sqrt(6 / this.in);
     else bound = Math.sqrt(6 / (this.in + this.out));
     const w = new Float32Array(n);
     let s = (seed * 2654435761) >>> 0 || 1;
     for (let k = 0; k < n; k++) { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; w[k] = ((s >>> 0) / 4294967296 * 2 - 1) * bound; }
+    this.ctx.flush();   // must not overtake recorded work that reads the old weights
     this.W.write(w);
     this.b.write(new Float32Array(this.out));
   }
+
+  destroy() { destroyAll(this.W, this.b, this.gW, this.gb); }
 }
 
 /**
@@ -8214,6 +8910,7 @@ class FourierFeatures {
   }
   get params() { return []; }
   forward(X, Y, batch) { this.k.run(batch * this.in, { inF: this.in, bands: this.bands }, { X, Y }); return Y; }
+  destroy() { /* a kernel only */ }
 }
 
 /**
@@ -8232,10 +8929,13 @@ class MLP {
     this.layers = [];
     for (let k = 0; k + 1 < sizes.length; k++) {
       const last = k + 2 === sizes.length;
-      this.layers.push(new Dense(ctx, sizes[k], sizes[k + 1], { act: last ? o.out || 'none' : o.act || 'relu', first: k === 0, seed: o.seed ? o.seed + k : undefined }));
+      this.layers.push(new Dense(ctx, sizes[k], sizes[k + 1], { act: last ? o.out || 'none' : o.act || 'relu', first: k === 0, seed: o.seed !== undefined ? o.seed + k : undefined }));
     }
     const A = (n, label) => ctx.array('f32', n, { label });
     this.acts = [A(this.maxBatch * sizes[0], 'nn-a0'), ...this.layers.map((l, k) => A(this.maxBatch * l.out, `nn-a${k + 1}`))];
+    // layers whose derivative needs the pre-activation z (sin, gelu) keep it here
+    this.pre = this.layers.map((l, k) => (DERIV_FROM_Y[l.act] ? null : A(this.maxBatch * l.out, `nn-z${k + 1}`)));
+    this._actK = new Map();
     this.grads = this.acts.map((a, k) => (k === 0 ? null : A(a.length, `nn-d${k}`)));
     this.dZ = A(this.maxBatch * Math.max(...this.layers.map((l) => l.out)), 'nn-dz');
     this.input = this.encoder ? A(this.maxBatch * o.layers[0], 'nn-x') : this.acts[0];
@@ -8262,23 +8962,33 @@ class MLP {
 
   /** Y = net(X) for `batch` rows (X: [batch × in], or this.input when omitted). */
   forward(X = this.input, batch = this.maxBatch) {
-    if (batch > this.maxBatch) throw new Error(`MLP.forward: batch ${batch} > maxBatch ${this.maxBatch}`);
+    if (batch > this.maxBatch) throw new SIError(`MLP.forward: batch ${batch} > maxBatch ${this.maxBatch}`, 'invalid-argument');
     let a = this.acts[0];
     if (this.encoder) this.encoder.forward(X, a, batch);
     else if (X !== a) this.ctx.copy(X, a, batch * this.layers[0].in * 4);
     this.layers.forEach((l, k) => {
-      gemm(this.ctx, this.acts[k], l.W, this.acts[k + 1], { M: batch, N: l.out, K: l.in, bias: l.b, act: l.act });
+      if (!this.pre[k]) { gemm(this.ctx, this.acts[k], l.W, this.acts[k + 1], { M: batch, N: l.out, K: l.in, bias: l.b, act: l.act }); return; }
+      // keep z = X W + b for the backward pass, then y = act(z)
+      gemm(this.ctx, this.acts[k], l.W, this.pre[k], { M: batch, N: l.out, K: l.in, bias: l.b, act: 'none' });
+      this._act(l.act).run(batch * l.out, null, { Z: this.pre[k], Y: this.acts[k + 1] });
     });
     return this.output;
+  }
+
+  _act(act) {
+    if (!this._actK.has(act)) {
+      this._actK.set(act, this.ctx.kernel({ name: `nn-act-${act}`, buffers: { Z: { type: 'f32', access: 'read' }, Y: { type: 'f32' } },
+        code: `let x = Z[i]; Y[i] = ${ACTIVATIONS[act].f};` }));
+    }
+    return this._actK.get(act);
   }
 
   _deriv(act) {
     if (!this._derivK.has(act)) {
       const fromY = DERIV_FROM_Y[act];
-      if (!fromY) throw new Error(`MLP.backward: activation ${act} needs its pre-activation; use relu, leaky, tanh, sigmoid or none`);
       this._derivK.set(act, this.ctx.kernel({
         name: `nn-deriv-${act}`, buffers: { dY: { type: 'f32', access: 'read' }, Y: { type: 'f32', access: 'read' }, dZ: { type: 'f32' } },
-        code: `let y = Y[i]; dZ[i] = dY[i] * (${fromY});`,
+        code: fromY ? `let y = Y[i]; dZ[i] = dY[i] * (${fromY});` : `let x = Y[i]; dZ[i] = dY[i] * (${ACTIVATIONS[act].df});`,   // Y holds z here
       }));
     }
     return this._derivK.get(act);
@@ -8286,10 +8996,11 @@ class MLP {
 
   /** Backpropagate dY = ∂L/∂output ([batch × out]); fills every layer's gW, gb. */
   backward(dY, batch) {
+    if (batch > this.maxBatch) throw new SIError(`MLP.backward: batch ${batch} > maxBatch ${this.maxBatch}`, 'invalid-argument');
     let d = dY;
     for (let k = this.layers.length - 1; k >= 0; k--) {
       const l = this.layers[k];
-      this._deriv(l.act).run(batch * l.out, null, { dY: d, Y: this.acts[k + 1], dZ: this.dZ });
+      this._deriv(l.act).run(batch * l.out, null, { dY: d, Y: this.pre[k] || this.acts[k + 1], dZ: this.dZ });
       gemm(this.ctx, this.acts[k], this.dZ, l.gW, { M: l.in, N: l.out, K: batch, transA: true });          // dW = Xᵀ dZ
       this.colSumK.dispatch(l.out, { rows: batch, cols: l.out }, { D: this.dZ, g: l.gb });                    // db = Σ dZ
       if (k > 0) {
@@ -8297,6 +9008,11 @@ class MLP {
         d = this.grads[k];
       }
     }
+  }
+
+  /** Free every buffer of the network (its layers, activations and gradients). */
+  destroy() {
+    destroyAll(this.layers, this.acts, this.grads, this.pre, this.dZ, this.encoder ? this.input : null);
   }
 }
 
@@ -8322,12 +9038,14 @@ class MSELoss {
   }
   /** Returns this.grad; call readLoss() for the value. */
   run(Y, T, count) {
+    if (count > this.grad.length) throw new SIError(`MSELoss.run: ${count} elements > maxElems ${this.grad.length}`, 'invalid-argument');
     this.groups = Math.min(1024, Math.ceil(count / 256));
     this.ctx.clear(this.sum);
     this.k.dispatch(this.groups, { count, scale: 1 / count }, { Y, T, dY: this.grad, part: this.sum });
     return this.grad;
   }
   async readLoss() { const p = await this.sum.read(this.groups); return p.reduce((a, b) => a + b, 0); }
+  destroy() { destroyAll(this.grad, this.sum); }
 }
 
 /** Adam (Kingma & Ba 2015) with bias correction; optional weight decay (AdamW) and gradient clipping. */
@@ -8357,6 +9075,8 @@ class Adam {
     this.params.forEach((p, k) => this.k.run(p.w.length, { lr: this.lr, b1: this.beta1, b2: this.beta2, eps: this.eps, c1, c2, wd: this.weightDecay, clip: this.clip },
       { w: p.w, g: p.g, m: this.state[k].m, v: this.state[k].v }));
   }
+  /** Free the moment buffers (the parameters belong to the network). */
+  destroy() { destroyAll(this.state.map((s) => [s.m, s.v])); this.state = []; }
 }
 
 /** Plain SGD with momentum. */
@@ -8370,6 +9090,7 @@ class SGD {
     });
   }
   step() { this.params.forEach((p, k) => this.k.run(p.w.length, { lr: this.lr, mu: this.momentum }, { w: p.w, g: p.g, v: this.vel[k] })); }
+  destroy() { destroyAll(this.vel); this.vel = []; }
 }
 
 /**
@@ -8386,7 +9107,10 @@ class Population {
   constructor(ctx, o) {
     this.ctx = ctx;
     this.sizes = o.layers;
-    this.count = o.count + (o.count & 1);
+    // agents come in antithetic pairs (θ + σε, θ − σε)
+    if (!(Number.isInteger(o.count) && o.count >= 2 && o.count % 2 === 0))
+      throw new SIError(`Population: count must be an even number ≥ 2 (agents come in antithetic pairs); got ${o.count}`, 'invalid-argument');
+    this.count = o.count;
     this.sigma = o.sigma ?? 0.05;
     this.lr = o.lr ?? 0.03;
     this.act = o.act || 'tanh';
@@ -8400,7 +9124,7 @@ class Population {
     this.theta = ctx.array('f32', n, { label: 'pop-theta' });
     this.weights = ctx.array('f32', this.count, { label: 'pop-rank-weights' });
     const init = new Float32Array(n);
-    let s = this.seed;
+    let s = (this.seed >>> 0) % 2147483647 || 1;   // the Lehmer generator below is stuck at 0 otherwise
     for (let k = 0; k + 1 < this.sizes.length; k++) {
       const a = this.sizes[k], b = this.sizes[k + 1], bound = Math.sqrt(6 / (a + b));
       for (let q = 0; q < a * b; q++) { s = (s * 16807) % 2147483647; init[this.offsets[k] + q] = (s / 2147483647 * 2 - 1) * bound; }
@@ -8456,6 +9180,7 @@ class Population {
   /** One ES step from per-agent fitness (GArray or Float32Array, higher is better). Returns { mean, best }. */
   async update(fitness) {
     const f = fitness instanceof Float32Array ? fitness : await fitness.read(this.count);
+    if (f.length < this.count) throw new SIError(`Population.update: ${f.length} fitness values for ${this.count} agents`, 'invalid-argument');
     const P = this.count;
     const order = Array.from({ length: P }, (_, k) => k).sort((a, b) => f[a] - f[b]);
     const w = new Float32Array(P);
@@ -8468,30 +9193,33 @@ class Population {
     for (let k = 0; k < P; k++) { mean += f[k]; best = Math.max(best, f[k]); }
     return { mean: mean / P, best };
   }
+
+  destroy() { destroyAll(this.theta, this.weights); }
 }
 return { Dense, FourierFeatures, MLP, MSELoss, Adam, SGD, Population };
 })();
 
 // ---- src/nn/index.js
-const __m36 = (() => {
-const gemm = __m37.gemm;
-const gemmKernel = __m37.gemmKernel;
-const autotuneGemm = __m37.autotuneGemm;
-const GEMM_CONFIGS = __m37.GEMM_CONFIGS;
-const ACTIVATIONS = __m37.ACTIVATIONS;
-const MLP = __m38.MLP;
-const Dense = __m38.Dense;
-const FourierFeatures = __m38.FourierFeatures;
-const MSELoss = __m38.MSELoss;
-const Adam = __m38.Adam;
-const SGD = __m38.SGD;
-const Population = __m38.Population;
+const __m38 = (() => {
+const gemm = __m39.gemm;
+const gemmKernel = __m39.gemmKernel;
+const autotuneGemm = __m39.autotuneGemm;
+const GEMM_CONFIGS = __m39.GEMM_CONFIGS;
+const ACTIVATIONS = __m39.ACTIVATIONS;
+const MLP = __m40.MLP;
+const Dense = __m40.Dense;
+const FourierFeatures = __m40.FourierFeatures;
+const MSELoss = __m40.MSELoss;
+const Adam = __m40.Adam;
+const SGD = __m40.SGD;
+const Population = __m40.Population;
 // Neural networks: GEMM + dense layers + losses + optimisers + evolution strategies.
 return { gemm, gemmKernel, autotuneGemm, GEMM_CONFIGS, ACTIVATIONS, MLP, Dense, FourierFeatures, MSELoss, Adam, SGD, Population };
 })();
 
 // ---- src/interop/three.js
-const __m39 = (() => {
+const __m41 = (() => {
+const SIError = __m4.SIError;
 // three.js interop (r170+, WebGPURenderer + TSL). ShaderIntel and three.js share one GPUDevice;
 // simulation state is copied GPU→GPU into three.js storage attributes by ShaderIntel kernels,
 // and node materials read it in the vertex stage — nothing round-trips through the CPU.
@@ -8504,9 +9232,14 @@ const __m39 = (() => {
 //   scene.add(bodies.object);
 //   function frame() { world.step(1 / 60); bodies.update(); gpu.flush(); renderer.render(scene, camera); }
 //
+// gpu.flush() matters: ShaderIntel batches work until a flush, and three.js renders on its own
+// queue submissions, so without it three.js draws stale poses.
+//
 // This module never imports three.js: pass in the namespaces you use (no version lock-in).
 // It reaches the GPU buffer behind a three.js storage attribute through the WebGPU backend
 // (backend.get(attribute).buffer), which three.js has exposed since r160.
+
+
 
 /** A WebGPURenderer that uses ShaderIntel's device (features and limits already negotiated). */
 async function renderer(THREE, gpu, opts = {}) {
@@ -8518,10 +9251,10 @@ async function renderer(THREE, gpu, opts = {}) {
 /** The GPUBuffer three.js allocated for a storage attribute (created on demand). */
 function bufferOf(renderer, attribute) {
   const backend = renderer.backend;
-  if (!backend?.get || !backend.createStorageAttribute) throw new Error('ShaderIntel three interop: needs THREE.WebGPURenderer (WebGPU backend)');
+  if (!backend?.get || !backend.createStorageAttribute) throw new SIError('three interop: needs THREE.WebGPURenderer with the WebGPU backend', 'invalid-argument');
   let data = backend.get(attribute);
   if (!data.buffer) { backend.createStorageAttribute(attribute); data = backend.get(attribute); }
-  if (!data.buffer) throw new Error('ShaderIntel three interop: could not reach the storage buffer of an attribute');
+  if (!data.buffer) throw new SIError('three interop: could not reach the storage buffer of an attribute (three.js version not supported?)');
   return data.buffer;
 }
 
@@ -8566,8 +9299,12 @@ function bodies(o) {
     sphere: new THREE.SphereGeometry(1, 24, 16),
     capsule: new THREE.CapsuleGeometry(1, 2, 8, 16),
   };
+  const seen = new Set();
   for (const [name, shape] of Object.entries(SHAPES)) {
-    const material = o.material?.(name) || new THREE.MeshStandardNodeMaterial({ roughness: 0.55, metalness: 0.0 });
+    // each shape needs its own positionNode: clone a material the callback hands out more than once
+    let material = o.material?.(name) || new THREE.MeshStandardNodeMaterial({ roughness: 0.55, metalness: 0.0 });
+    if (seen.has(material)) material = material.clone();
+    seen.add(material);
     const base = instanceIndex.mul(3);
     const pv = data.element(base);
     const q = data.element(base.add(1));
@@ -8595,11 +9332,17 @@ function bodies(o) {
     object: group,
     meshes,
     attribute: attr,
-    /** Copy this frame's poses into three.js (GPU → GPU). Call after world.step(), before rendering. */
+    /** Copy this frame's poses into three.js (GPU → GPU). Call after world.step(), then gpu.flush(), before rendering. */
     update() {
       const n = world.count;
       for (const m of Object.values(meshes)) m.count = n;
       if (n) pack.run(n, { groups: (o.groups ?? 0xffffffff) >>> 0 }, { B: world.B, out: buf });
+    },
+    /** Remove the meshes from their parent and free their geometries and (default) materials. */
+    dispose() {
+      group.removeFromParent?.();
+      for (const g of Object.values(geometries)) g.dispose();
+      if (!o.material) for (const m of Object.values(meshes)) m.material.dispose();
     },
   };
 }
@@ -8613,7 +9356,8 @@ function particles(o) {
   const { THREE, TSL, renderer: r } = o;
   const src0 = typeof o.source === 'function' ? o.source() : o.source;
   const gpu = o.gpu || src0.ctx;
-  const max = o.max;
+  const max = o.max ?? Math.floor(src0.length / (o.stride ?? 1));
+  const countOf = () => (o.count === undefined ? max : typeof o.count === 'function' ? o.count() : o.count);
   const attr = new THREE.StorageInstancedBufferAttribute(max, 4);
   const buf = bufferOf(r, attr);
   const pack = gpu.kernel({
@@ -8633,9 +9377,15 @@ function particles(o) {
     object: mesh,
     attribute: attr,
     update() {
-      const n = Math.min(max, typeof o.count === 'function' ? o.count() : o.count);
+      const n = Math.max(0, Math.min(max, countOf() | 0));
       mesh.count = n;
       if (n) pack.run(n, { stride: o.stride ?? 1, scale: o.scale ?? 1, offset: o.offset ?? [0, 0, 0] }, { src: typeof o.source === 'function' ? o.source() : o.source, out: buf });
+    },
+    /** Remove the mesh from its parent and free its geometry and (default) material. */
+    dispose() {
+      mesh.removeFromParent?.();
+      mesh.geometry.dispose();
+      if (!o.material) material.dispose();
     },
   };
 }
@@ -8643,7 +9393,8 @@ return { renderer, bufferOf, bodies, particles };
 })();
 
 // ---- src/net/transport.js
-const __m41 = (() => {
+const __m43 = (() => {
+const SIError = __m4.SIError;
 // Transports for peer-to-peer sessions. Every transport hands out Channel objects:
 //   channel.send(message)          message: plain objects, arrays, numbers, strings, typed arrays
 //   channel.onmessage = (m) => {}
@@ -8651,8 +9402,11 @@ const __m41 = (() => {
 //
 // On the wire a message is JSON in which every typed array travels as base64 of its bytes, so
 // the bits arrive exactly: -0, NaN payloads and u32 words stored in float arrays (the rigid
-// body records keep collision masks that way) survive, where JSON numbers would not. Messages
-// longer than 64 KB are split into parts, under every browser's data-channel message limit.
+// body records keep collision masks that way) survive, where JSON numbers would not. Numbers
+// that JSON cannot represent (NaN, ±Infinity, -0), undefined, BigInt, Map, Set, Date and
+// ArrayBuffer are tagged too, so game state crosses the wire the way structuredClone copies it.
+// Decoding only ever constructs those types. Messages longer than 64 KB travel as binary parts
+// of at most 64 KB, under every browser's data-channel message limit.
 //
 // LoopbackNetwork  two (or more) endpoints in one page with simulated latency, jitter, loss and
 //                  reordering, driven by a seeded RNG — for tests, demos and tuning netcode.
@@ -8660,6 +9414,8 @@ const __m41 = (() => {
 //                  "state": reliable, ordered), with signalling through any Signaler:
 // BroadcastSignaler  same-origin tabs (BroadcastChannel) — no server needed for local play/testing.
 // WebSocketSignaler  your own relay server (it only forwards {room, from, payload} messages).
+
+
 
 /** Seeded xorshift32 → [0, 1). */
 function rng(seed) {
@@ -8685,33 +9441,42 @@ class LoopbackNetwork {
     this.stats = { sent: 0, dropped: 0, delivered: 0, bytes: 0 };
   }
   _link(deliver, reliable) {
-    let lastArrival = 0;
-    return {
-      onmessage: null,
+    // Reliable links deliver strictly in order: every message gets a sequence number and waits
+    // for its predecessors (timers alone reorder messages whose delays differ by under 1 ms).
+    let seqOut = 0, seqIn = 0, closed = false;
+    const ready = new Map();
+    const link = {
       send: (m) => {
+        if (closed) return;
         this.stats.sent++;
         if (!reliable && this.random() < this.loss) { this.stats.dropped++; return; }
         const copies = !reliable && this.random() < this.duplicate ? 2 : 1;
         const wire = this.codec ? encode(m) : null;
         if (wire) this.stats.bytes += wire.length;
         for (let c = 0; c < copies; c++) {
-          let delay = this.latency + (this.random() * 2 - 1) * this.jitter;
-          if (reliable) { delay = Math.max(delay, lastArrival - performance.now()); lastArrival = performance.now() + delay; }   // ordered
+          const delay = Math.max(0, this.latency + (this.random() * 2 - 1) * this.jitter);
           const copy = wire ? decode(wire) : structuredClone(m);
-          setTimeout(() => { this.stats.delivered++; deliver(copy); }, Math.max(0, delay));
+          if (!reliable) { setTimeout(() => { if (!closed) { this.stats.delivered++; deliver(copy); } }, delay); continue; }
+          const seq = seqOut++;
+          setTimeout(() => {
+            ready.set(seq, copy);
+            while (!closed && ready.has(seqIn)) { const x = ready.get(seqIn); ready.delete(seqIn++); this.stats.delivered++; deliver(x); }
+          }, delay);
         }
       },
-      close() {},
+      close() { closed = true; ready.clear(); },
     };
+    return link;
   }
+  /** Two connected endpoints [a, b], each { unreliable, reliable } (channel.close() stops its deliveries). */
   connect() {
     const a = { unreliable: null, reliable: null }, b = { unreliable: null, reliable: null };
     for (const kind of ['unreliable', 'reliable']) {
       const rel = kind === 'reliable';
       const ab = this._link((m) => b[kind].onmessage?.(m), rel);
       const ba = this._link((m) => a[kind].onmessage?.(m), rel);
-      a[kind] = { send: ab.send, onmessage: null, close() {} };
-      b[kind] = { send: ba.send, onmessage: null, close() {} };
+      a[kind] = { send: ab.send, onmessage: null, close() { ab.close(); ba.close(); } };
+      b[kind] = { send: ba.send, onmessage: null, close() { ab.close(); ba.close(); } };
     }
     return [a, b];
   }
@@ -8736,7 +9501,11 @@ class WebSocketSignaler {
     this.room = room;
     this.onmessage = null;
     this.ws = new WebSocket(url);
-    this.ready = new Promise((res, rej) => { this.ws.onopen = () => res(); this.ws.onerror = rej; });
+    this.ready = new Promise((res, rej) => {
+      this.ws.onopen = () => res();
+      this.ws.onerror = () => rej(new SIError(`WebSocketSignaler: cannot connect to ${url}`, 'error'));
+    });
+    this.ready.catch(() => {});   // reported to whoever awaits it (send), not as an unhandled rejection
     this.ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
       if (m.room === room && m.from !== this.id && (!m.to || m.to === this.id)) this.onmessage?.(m);
@@ -8755,16 +9524,25 @@ class WebSocketSignaler {
 class RTCPeer {
   constructor(signaler, o = {}) {
     this.signaler = signaler;
+    this.closed = false;
     this.pc = new RTCPeerConnection({ iceServers: o.iceServers || [] });
     this.channels = { unreliable: dataChannel(null), reliable: dataChannel(null) };
     this.remote = null;
+    let warned = false;
+    // a signaler that cannot send (an unreachable relay) is reported once, not every retry
+    const send = (payload, to) => {
+      try { Promise.resolve(signaler.send(payload, to)).catch((e) => { if (!warned) { warned = true; console.warn('RTCPeer signalling:', e?.message || e); } }); }
+      catch (e) { if (!warned) { warned = true; console.warn('RTCPeer signalling:', e?.message || e); } }
+    };
     const attach = (dc) => {
       dc.binaryType = 'arraybuffer';
       this.channels[dc.label === 'inputs' ? 'unreliable' : 'reliable'].attach(dc);
     };
-    this.ready = new Promise((resolve) => {
+    let fail;
+    this.ready = new Promise((resolve, reject) => {
+      fail = reject;
       let open = 0;
-      const check = (dc) => { dc.addEventListener('open', () => { if (++open === 2) resolve(this); }); };
+      const check = (dc) => { dc.addEventListener('open', () => { if (++open === 2) { clearInterval(this._hello); resolve(this); } }); };
       if (o.initiator) {
         const a = this.pc.createDataChannel('inputs', { ordered: false, maxRetransmits: 0 });
         const b = this.pc.createDataChannel('state', { ordered: true });
@@ -8773,24 +9551,40 @@ class RTCPeer {
         this.pc.ondatachannel = (e) => { attach(e.channel); check(e.channel); };
       }
     });
-    this.pc.onicecandidate = (e) => { if (e.candidate) signaler.send({ ice: e.candidate.toJSON() }, this.remote); };
+    this._fail = (e) => fail(e);
+    this.ready.catch(() => {});   // callers that await it see the rejection
+    this.pc.onconnectionstatechange = () => {
+      if (this.pc.connectionState === 'failed')
+        fail(new SIError('RTCPeer: the connection failed — the peers found no network path (add a TURN server to iceServers)'));
+    };
+    this.pc.onicecandidate = (e) => { if (e.candidate) send({ ice: e.candidate.toJSON() }, this.remote); };
     // Signalling messages are handled one at a time, and candidates that arrive before the remote
     // description is applied wait for it (dropping them can leave the connection without a path).
+    // Lost messages are recovered: the guest says hello until the channels open; the host answers a
+    // repeated hello by re-sending its offer, and the guest a repeated offer by re-sending its answer.
     const pendingIce = [];
     let chain = Promise.resolve();
     const handle = async (m) => {
+      if (this.closed) return;
       const p = m.payload;
       if (p.hello) {
-        if (!o.initiator || this.remote) return;   // the first guest to say hello is the peer
-        this.remote = m.from;
-        await this.pc.setLocalDescription(await this.pc.createOffer());
-        signaler.send({ sdp: this.pc.localDescription.toJSON() }, this.remote);
+        if (!o.initiator) return;
+        if (this.remote && m.from !== this.remote) return;   // the first guest to say hello is the peer
+        if (!this.remote) {
+          this.remote = m.from;
+          await this.pc.setLocalDescription(await this.pc.createOffer());
+        } else if (this.pc.signalingState !== 'have-local-offer') return;   // answered already: nothing was lost
+        send({ sdp: this.pc.localDescription.toJSON() }, this.remote);
       } else if (p.sdp) {
         if (this.remote && m.from !== this.remote) return;
         this.remote = m.from;
-        clearInterval(this._hello);
+        if (p.sdp.type === 'offer' && this.pc.signalingState === 'stable' && this.pc.localDescription?.type === 'answer') {
+          send({ sdp: this.pc.localDescription.toJSON() }, this.remote);   // our answer was lost: repeat it
+          return;
+        }
+        if (p.sdp.type === 'answer' && this.pc.signalingState !== 'have-local-offer') return;   // a duplicate answer
         await this.pc.setRemoteDescription(p.sdp);
-        if (p.sdp.type === 'offer') { await this.pc.setLocalDescription(await this.pc.createAnswer()); signaler.send({ sdp: this.pc.localDescription.toJSON() }, this.remote); }
+        if (p.sdp.type === 'offer') { await this.pc.setLocalDescription(await this.pc.createAnswer()); send({ sdp: this.pc.localDescription.toJSON() }, this.remote); }
         for (const c of pendingIce.splice(0)) await this.pc.addIceCandidate(c).catch(() => {});
       } else if (p.ice) {
         if (this.remote && m.from !== this.remote) return;
@@ -8799,49 +9593,84 @@ class RTCPeer {
       }
     };
     signaler.onmessage = (m) => { chain = chain.then(() => handle(m)).catch((e) => console.warn('RTCPeer signalling:', e)); };
-    // The guest says hello until the host answers: the host may not be listening yet (a page that
-    // is still initialising its GPU), and a single hello would then be lost for good.
+    // The guest says hello until the channels open: the host may not be listening yet (a page that
+    // is still initialising its GPU), and a single hello — or the reply to it — could be lost.
     if (!o.initiator) {
-      signaler.send({ hello: true });
-      this._hello = setInterval(() => signaler.send({ hello: true }), 500);
+      send({ hello: true });
+      this._hello = setInterval(() => send({ hello: true }), 500);
     }
   }
-  close() { clearInterval(this._hello); this.pc.close(); this.signaler.close?.(); }
+  /** Close the connection and the signaler (the peer owns it); a pending ready rejects. */
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    clearInterval(this._hello);
+    this.signaler.onmessage = null;
+    this.signaler.close?.();
+    this.pc.close();
+    this._fail(new SIError('RTCPeer: closed before the connection opened'));
+  }
 }
 
-const CHUNK = 65536;
+const CHUNK = 65536;          // bytes per data-channel message, under every browser's limit
+const PART = 0x53495054;      // 'SIPT': a binary part of a long message
+const PART_TIMEOUT = 15000;   // incomplete messages are forgotten after this (a part lost on an unreliable channel)
 
 /**
  * Wrap an RTCDataChannel (or anything with send(), onmessage and readyState) as a Channel: the
- * wire encoding above, with long messages split into parts and reassembled. Use it to run a
- * RollbackSession over a WebRTC connection you set up yourself.
+ * wire encoding above, with long messages split into binary parts of at most 64 KB and
+ * reassembled. Use it to run a RollbackSession over a WebRTC connection you set up yourself.
  */
 function dataChannel(dc) {
   const parts = new Map();
   let next = 1;
+  const utf8 = new TextEncoder(), text8 = new TextDecoder();
   const ch = {
     dc: null,
     onmessage: null,
     send(m) {
       if (this.dc?.readyState !== 'open') return;
       const s = encode(m);
-      if (s.length <= CHUNK) { this.dc.send(s); return; }
-      const id = next++, n = Math.ceil(s.length / CHUNK);
-      for (let k = 0; k < n; k++) this.dc.send(JSON.stringify({ __part: id, k, n, d: s.slice(k * CHUNK, (k + 1) * CHUNK) }));
+      if (s.length * 3 <= CHUNK) { this.dc.send(s); return; }   // surely small enough as UTF-8
+      const bytes = utf8.encode(s);
+      if (bytes.length <= CHUNK) { this.dc.send(s); return; }
+      const body = CHUNK - 12, id = next++ >>> 0, n = Math.ceil(bytes.length / body);
+      for (let k = 0; k < n; k++) {
+        const chunk = bytes.subarray(k * body, (k + 1) * body);
+        const msg = new Uint8Array(12 + chunk.length);
+        const h = new DataView(msg.buffer);
+        h.setUint32(0, PART); h.setUint32(4, id); h.setUint16(8, k); h.setUint16(10, n);
+        msg.set(chunk, 12);
+        this.dc.send(msg.buffer);
+      }
     },
-    close() { this.dc?.close(); },
+    close() { this.dc?.close(); parts.clear(); },
     attach(d) {
       this.dc = d;
       d.onmessage = (e) => {
-        const text = typeof e.data === 'string' ? e.data : new TextDecoder().decode(e.data);
-        if (!text.startsWith('{"__part"')) { this.onmessage?.(decode(text)); return; }
-        const p = JSON.parse(text);
-        const got = parts.get(p.__part) || { n: p.n, have: 0, d: [] };
-        if (got.d[p.k] === undefined) { got.d[p.k] = p.d; got.have++; }
-        parts.set(p.__part, got);
-        if (got.have < got.n) return;
-        parts.delete(p.__part);
-        this.onmessage?.(decode(got.d.join('')));
+        let text;
+        if (typeof e.data === 'string') text = e.data;
+        else {
+          const bytes = new Uint8Array(e.data);
+          const h = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+          if (bytes.length < 12 || h.getUint32(0) !== PART) text = text8.decode(bytes);
+          else {
+            const id = h.getUint32(4), k = h.getUint16(8), n = h.getUint16(10), now = performance.now();
+            for (const [key, g] of parts) if (now - g.t > PART_TIMEOUT) parts.delete(key);
+            const got = parts.get(id) || { n, have: 0, d: [], t: now };
+            if (got.d[k] === undefined && k < got.n) { got.d[k] = bytes.slice(12); got.have++; }
+            parts.set(id, got);
+            if (got.have < got.n) return;
+            parts.delete(id);
+            const all = new Uint8Array(got.d.reduce((a, c) => a + c.length, 0));
+            let o = 0;
+            for (const c of got.d) { all.set(c, o); o += c.length; }
+            text = text8.decode(all);
+          }
+        }
+        let m;
+        try { m = decode(text); } catch (err) { console.warn('dataChannel: dropped a malformed message:', err.message); return; }
+        this.onmessage?.(m);
       };
     },
   };
@@ -8859,18 +9688,62 @@ function fromBase64(b64) {
   for (let k = 0; k < s.length; k++) bytes[k] = s.charCodeAt(k);
   return bytes;
 }
-/** The wire encoding: JSON, with typed arrays as { __ta: type, b: base64 of the bytes }. */
+// Typed arrays the decoder may construct (a remote message must not name arbitrary globals).
+const TYPED = Object.fromEntries(['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array',
+  'Float16Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array', 'DataView']
+  .filter((n) => typeof globalThis[n] === 'function').map((n) => [n, globalThis[n]]));
+
+/**
+ * The wire encoding: JSON in which typed arrays travel as { __ta: type, b: base64 of the bytes },
+ * and values JSON cannot carry are tagged { __t: kind, v }: NaN, ±Infinity and -0, undefined,
+ * BigInt, Map, Set, Date, ArrayBuffer (and objects that happen to have a __t / __ta key).
+ */
 function encode(m) {
-  return JSON.stringify(m, (k, v) => (ArrayBuffer.isView(v) ? { __ta: v.constructor.name, b: toBase64(new Uint8Array(v.buffer, v.byteOffset, v.byteLength)) } : v));
+  return JSON.stringify(m, function (k, v) {
+    const raw = this[k];   // the value before toJSON (a Date would already be a string)
+    if (ArrayBuffer.isView(raw)) return { __ta: raw.constructor.name, b: toBase64(new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength)) };
+    if (raw instanceof ArrayBuffer) return { __t: 'ab', b: toBase64(new Uint8Array(raw)) };
+    if (typeof raw === 'number') return Number.isFinite(raw) && !Object.is(raw, -0) ? raw : { __t: 'num', v: Object.is(raw, -0) ? '-0' : String(raw) };
+    if (typeof raw === 'bigint') return { __t: 'big', v: raw.toString() };
+    if (raw === undefined) return k === '' ? undefined : { __t: 'u' };
+    if (raw instanceof Date) return { __t: 'date', v: String(raw.getTime()) };
+    if (raw instanceof Map) return { __t: 'map', v: [...raw] };
+    if (raw instanceof Set) return { __t: 'set', v: [...raw] };
+    if (raw && typeof raw === 'object' && !Array.isArray(raw) && v === raw && ('__t' in raw || '__ta' in raw)) return { __t: 'obj', v: Object.entries(raw) };
+    return v;
+  });
 }
+
+/** Inverse of encode(). Throws SIError on a malformed message (unknown typed array, bad sizes). */
 function decode(s) {
-  return JSON.parse(s, (k, v) => (v && typeof v === 'object' && typeof v.__ta === 'string' ? new globalThis[v.__ta](fromBase64(v.b).buffer) : v));
+  return JSON.parse(s, (k, v) => {
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return v;
+    if (typeof v.__ta === 'string') {
+      const Ctor = TYPED[v.__ta];
+      if (!Ctor || typeof v.b !== 'string') throw new SIError(`decode: "${v.__ta}" is not a typed array`, 'invalid-argument');
+      const bytes = fromBase64(v.b);
+      if (Ctor === DataView) return new DataView(bytes.buffer);
+      if (bytes.byteLength % Ctor.BYTES_PER_ELEMENT) throw new SIError(`decode: ${bytes.byteLength} bytes are not a whole number of ${v.__ta} elements`, 'invalid-argument');
+      return new Ctor(bytes.buffer);
+    }
+    switch (v.__t) {
+      case 'num': return Number(v.v);
+      case 'u': return undefined;
+      case 'big': return BigInt(v.v);
+      case 'date': return new Date(Number(v.v));
+      case 'map': return new Map(v.v);
+      case 'set': return new Set(v.v);
+      case 'ab': return fromBase64(v.b).buffer;
+      case 'obj': return Object.fromEntries(v.v);
+      default: return v;
+    }
+  });
 }
 return { LoopbackNetwork, BroadcastSignaler, WebSocketSignaler, RTCPeer, dataChannel, encode, decode };
 })();
 
 // ---- src/net/session.js
-const __m42 = (() => {
+const __m44 = (() => {
 // Rollback netcode (in the style of GGPO) for deterministic GPU simulations.
 //
 // Every peer runs the whole simulation at a fixed tick. A player's input for tick t is
@@ -8954,6 +9827,8 @@ class RollbackSession {
     this.expectEpoch = 0;        // hashes from older epochs describe a history the peer has abandoned
     this.resyncWanted = false;
     this.pendingState = null;
+    this.importTick = -1;        // the tick of the last state adopted from the authority (no rollback reaches before it)
+    this._lastStateSent = -Infinity;
     this.tick = 0;
     this.inputs = Array.from({ length: this.players }, () => new Map());
     this.predicted = Array.from({ length: this.players }, () => new Map());
@@ -8965,7 +9840,8 @@ class RollbackSession {
     this.chain = '0000000000000000';
     this.chainTick = -1;
     this.log = { inputs: [], hashes: {} };
-    this.stats = { rollbacks: 0, rolledBackTicks: 0, stalls: 0, desyncs: 0, resyncs: 0, statesSent: 0, statesReceived: 0, exportErrors: 0, gpuWaits: 0, hashesRecorded: 0, hashesDropped: 0, hashesStale: 0, ping: 0, inSyncTick: -1, sent: 0, received: 0 };
+    this.stats = { rollbacks: 0, rolledBackTicks: 0, stalls: 0, desyncs: 0, resyncs: 0, statesSent: 0, statesReceived: 0, statesRejected: 0, exportErrors: 0, gpuWaits: 0,
+      hashesRecorded: 0, hashesDropped: 0, hashesStale: 0, messagesRejected: 0, ping: 0, inSyncTick: -1, sent: 0, received: 0 };
     const zero = new Uint8Array(this.inputSize);
     for (let t = 0; t < this.delay; t++) this.inputs[this.local].set(t, zero);
     this.confirmed[this.local] = this.delay - 1;
@@ -9086,12 +9962,15 @@ class RollbackSession {
   // Authority: send the state before tick S, the newest one whose every input is final.
   _sendState() {
     this.resyncWanted = false;
+    // at most one state a second: a peer that keeps asking cannot make us export continuously
+    if (this.tick - this._lastStateSent < Math.round(1 / this.dt)) { this.resyncWanted = true; return; }
     const S = Math.min(this.confirmedTick + 1, this.tick - 1);
     const e = this.ring[S % this.ring.length];
     if (!e || e.tick !== S || !this.sim.exportState) return;
     const epoch = this.remoteEpoch + 1;
     this.expectEpoch = epoch;
     this.stats.statesSent++;
+    this._lastStateSent = this.tick;
     const t0 = performance.now();
     this.sim.exportState(e.snap).then((state) => {
       this.stats.lastExport = { tick: S, ms: Math.round(performance.now() - t0), sentAt: this.tick };
@@ -9116,10 +9995,13 @@ class RollbackSession {
       return;
     }
     this.sim.importState(m.state);
-    if (this.game && m.game) this.game.load(structuredClone(m.game));
+    if (this.game && m.game !== undefined) this.game.load(structuredClone(m.game));
     this.epoch = m.epoch;
+    this.importTick = S;
     this.stats.lastResync = { tick: S, appliedAt: this.tick };
     this.rollbackTo = Infinity;
+    // hashes still queued for ticks before the import would hash snapshots of the abandoned history
+    this.pendingHash = this.pendingHash.filter((T) => T >= S - 1);
     // hashes of the abandoned history are recomputed (and re-sent) from the new one
     for (const [T, h] of this.hashes) if (T >= S - 1) { delete h.local; h.reported = false; }
     for (let T = Math.ceil(Math.max(0, S - 1) / this.hashEvery) * this.hashEvery; T < this.tick; T += this.hashEvery)
@@ -9154,35 +10036,55 @@ class RollbackSession {
     this.stats.sent++;
   }
 
+  // A message from the network is checked before it touches the session: a malformed or forged
+  // packet is dropped (stats.messagesRejected), never allowed to throw or to index out of range.
+  _validPlayer(p) { return Number.isInteger(p) && p >= 0 && p < this.players && p !== this.local; }
+
   _onInputs(m) {
-    if (m.from === this.local) return;
+    if (!m || m.from === this.local) return;
+    if (!this._validPlayer(m.from) || !Number.isInteger(m.start) || m.start < 0 || !Array.isArray(m.inputs) || m.inputs.length > 4 * this.redundancy) {
+      this.stats.messagesRejected++;
+      return;
+    }
     this.stats.received++;
-    if (m.echo) this.stats.ping = Math.round(performance.now() - m.echo);
-    this._echo = m.sent;
+    if (typeof m.echo === 'number') this.stats.ping = Math.round(performance.now() - m.echo);
+    this._echo = typeof m.sent === 'number' ? m.sent : undefined;
     const p = m.from;
     m.inputs.forEach((arr, k) => {
       const t = m.start + k;
-      if (this.inputs[p].has(t)) return;
+      if (this.inputs[p].has(t) || !Array.isArray(arr) || arr.length !== this.inputSize) return;
       const v = Uint8Array.from(arr);
       this.inputs[p].set(t, v);
-      if (t < this.tick) {
+      // inputs before an adopted state are already part of it: no rollback reaches before the import
+      if (t < this.tick && t >= this.importTick) {
         const pred = this.predicted[p].get(t);
         if (!sameBytes(pred, v)) this.rollbackTo = Math.min(this.rollbackTo, t);
-        this.predicted[p].delete(t);
       }
+      this.predicted[p].delete(t);
     });
     while (this.inputs[p].has(this.confirmed[p] + 1)) this.confirmed[p]++;
   }
 
   _onReliable(m) {
-    if (m.from === this.local) return;
-    if (m.type === 'hash') this._gotHash(m.tick, m.hash, 'remote', m.epoch ?? 0);
+    if (!m || m.from === this.local) return;
+    if (!this._validPlayer(m.from)) { this.stats.messagesRejected++; return; }
+    if (m.type === 'hash') {
+      if (!Number.isInteger(m.tick) || typeof m.hash !== 'string' || !/^[0-9a-f]{16}$/.test(m.hash)) { this.stats.messagesRejected++; return; }
+      this._gotHash(m.tick, m.hash, 'remote', Number.isInteger(m.epoch) ? m.epoch : 0);
+    }
     if (m.type === 'resync' && this.resync && this.local === this.authority) this.resyncWanted = true;
     if (m.type === 'state') {
       this.stats.statesReceived++;
       this.stats.lastStateReceivedAt = this.tick;
-      if (this.stateHandler) this.stateHandler(m);   // a custom policy
-      else if (this.resync && (!this.pendingState || m.epoch > this.pendingState.epoch)) this.pendingState = m;
+      if (this.stateHandler) { this.stateHandler(m); return; }   // a custom policy decides
+      // Only the authority's states are adopted, only by the other peers, and only when newer than
+      // the state we hold: a peer cannot overwrite the authoritative world or move its epoch back.
+      const newer = Number.isInteger(m.epoch) && m.epoch > this.epoch && (!this.pendingState || m.epoch > this.pendingState.epoch);
+      if (!this.resync || this.local === this.authority || m.from !== this.authority || !newer || !Number.isInteger(m.tick) || m.tick < 0 || !m.state) {
+        this.stats.statesRejected++;
+        return;
+      }
+      this.pendingState = m;
     }
   }
 
@@ -9218,24 +10120,26 @@ return { chainHash, RollbackSession, verifyTranscript };
 })();
 
 // ---- src/net/index.js
-const __m40 = (() => {
-const LoopbackNetwork = __m41.LoopbackNetwork;
-const RTCPeer = __m41.RTCPeer;
-const BroadcastSignaler = __m41.BroadcastSignaler;
-const WebSocketSignaler = __m41.WebSocketSignaler;
-const dataChannel = __m41.dataChannel;
-const encode = __m41.encode;
-const decode = __m41.decode;
-const RollbackSession = __m42.RollbackSession;
-const verifyTranscript = __m42.verifyTranscript;
-const chainHash = __m42.chainHash;
+const __m42 = (() => {
+const LoopbackNetwork = __m43.LoopbackNetwork;
+const RTCPeer = __m43.RTCPeer;
+const BroadcastSignaler = __m43.BroadcastSignaler;
+const WebSocketSignaler = __m43.WebSocketSignaler;
+const dataChannel = __m43.dataChannel;
+const encode = __m43.encode;
+const decode = __m43.decode;
+const RollbackSession = __m44.RollbackSession;
+const verifyTranscript = __m44.verifyTranscript;
+const chainHash = __m44.chainHash;
 // Peer-to-peer play: transports and rollback sessions for deterministic GPU simulations.
 return { LoopbackNetwork, RTCPeer, BroadcastSignaler, WebSocketSignaler, dataChannel, encode, decode, RollbackSession, verifyTranscript, chainHash };
 })();
 
 // ---- src/verify/index.js
-const __m43 = (() => {
-const MSELoss = __m38.MSELoss;
+const __m45 = (() => {
+const MSELoss = __m40.MSELoss;
+const COLOR_ROUNDS = __m36.COLOR_ROUNDS;
+const destroyAll = __m9.destroyAll;
 // Certificates: small, independent checkers for the results of the big, optimised kernels.
 //
 // This follows the design of proof assistants (Lean's small kernel; Bend 2's `--verdict`, which
@@ -9246,6 +10150,8 @@ const MSELoss = __m38.MSELoss;
 // probabilistic with a stated error bound (Freivalds), or a physical law with a tolerance
 // (complementarity, conservation, Coulomb's cone). The laws of the library are listed in
 // LAWS.md and run by proveAll() — the analogue of `bend PROOF.bend` before a release.
+
+
 
 
 
@@ -9281,7 +10187,7 @@ async function checkSorted(ctx, keys, n) {
 
 /**
  * a and b hold the same multiset of u32 values: two order-independent fingerprints (sums of
- * independent hashes) must match. A false accept needs a collision in both 32-bit sums.
+ * independent hashes) must match. Probabilistic: a false accept needs a collision in both 32-bit sums.
  */
 async function checkPermutation(ctx, a, b, n) {
   const fp = ctx.array('u32', 4);
@@ -9297,8 +10203,12 @@ async function checkPermutation(ctx, a, b, n) {
 
 /**
  * Freivalds' certificate for C = op(A) op(B): for random ±1 vectors r, compare A(Br) with Cr.
- * O(n²) per trial against the O(n³) product; a wrong C survives a trial with probability ≤ 1/2.
- * o: { M, N, K, transA, transB, trials (default 4), tol (relative to the row's L2 norm, default 1e-4) }
+ * O(n²) per trial against the O(n³) product; a wrong C survives a trial with probability ≤ 1/2,
+ * so the vectors are fresh random bits on every call (fixed vectors could be defeated, and with
+ * N > 2^trials some columns would always share a sign pattern). An error of at least tol times
+ * its row's L2 norm in a single entry is caught by every trial.
+ * o: { M, N, K, transA, transB, trials (default 4), tol (relative to the row's L2 norm, default 1e-4),
+ *      seed (optional: reproducible vectors, which forfeits the guarantee against adversarial C) }
  */
 async function freivalds(ctx, A, B, C, o) {
   const { M, N, K } = o;
@@ -9313,10 +10223,13 @@ async function freivalds(ctx, A, B, C, o) {
   const absvec = ctx.kernel({ name: 'verify-rownorm', buffers: { X: { type: 'f32', access: 'read' }, y: { type: 'f32' } }, uniforms: { cols: 'u32' },
     code: 'var s = 0.0; for (var c = 0u; c < u.cols; c++) { let x = X[i * u.cols + c]; s += x * x; } y[i] = sqrt(s);' });
   let maxRel = 0;
+  const bits = new Uint8Array(N);
+  let seed = o.seed === undefined ? 0 : (o.seed >>> 0) || 1;
   for (let t = 0; t < trials; t++) {
     const rv = new Float32Array(N);
-    let s = (0x9e3779b9 * (t + 1)) >>> 0;
-    for (let k = 0; k < N; k++) { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; rv[k] = s & 1 ? 1 : -1; }
+    if (o.seed === undefined) globalThis.crypto.getRandomValues(bits);
+    else for (let k = 0; k < N; k++) { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; bits[k] = seed; }
+    for (let k = 0; k < N; k++) rv[k] = bits[k] & 1 ? 1 : -1;
     ctx.flush();
     r.write(rv);
     // B r : B is K×N (or N×K transposed)
@@ -9325,16 +10238,21 @@ async function freivalds(ctx, A, B, C, o) {
     matvec('verify-mv-c', M, N, false).run(M, { cols: N }, { X: C, v: r, y: Cr });
     absvec.run(M, { cols: N }, { X: C, y: mag });
     const [x, y, m] = [await ABr.read(), await Cr.read(), await mag.read()];
-    for (let k = 0; k < M; k++) maxRel = Math.max(maxRel, Math.abs(x[k] - y[k]) / Math.max(1e-6, m[k], Math.abs(x[k])));
+    // relative to the row's L2 norm only: then an entry off by ≥ tol·‖row‖ is always caught
+    for (let k = 0; k < M; k++) maxRel = Math.max(maxRel, Math.abs(x[k] - y[k]) / Math.max(1e-6, m[k]));
   }
   for (const b of [r, Br, ABr, Cr, mag]) b.destroy();
-  return verdict(maxRel <= tol, { maxRelative: maxRel, trials, falseAcceptBound: 2 ** -trials });
+  return verdict(maxRel < tol, { maxRelative: maxRel, trials, falseAcceptBound: 2 ** -trials });
 }
 
-/** No two dynamic bodies of one colour share a contact or a joint (RigidWorld, after a step). Exact. */
+/**
+ * No two dynamic bodies of one colour share a contact or an active joint (RigidWorld, after a
+ * step). Exact. Disabled or broken joints, and joints of disabled bodies, are ignored, as the
+ * solver ignores them.
+ */
 async function checkColoring(world) {
   const nc = (await world.cnts.read(8))[1];
-  const colors = await world.color[20 & 1].read(world.count);
+  const colors = await world.color[COLOR_ROUNDS & 1].read(world.count);
   const raw = await world.C[(world.frame - 1) & 1].read(Math.max(1, nc) * 6);
   const u = new Uint32Array(raw.buffer, raw.byteOffset, raw.length);
   const bodies = await world.readBodies();
@@ -9348,13 +10266,19 @@ async function checkColoring(world) {
     if ((bodies.flags[a] | bodies.flags[b]) & 6) continue;
     if (colors[a] === colors[b]) conflicts++;
   }
-  for (const j of world.joints) if (dyn(j.b) && m(j.a) > 0 && m(j.b) > 0 && colors[j.a] === colors[j.b]) conflicts++;
+  const { broken } = await world.readJoints();
+  world.joints.forEach((j, k) => {
+    if (!j.enabled || broken[k] || !dyn(j.b) || ((bodies.flags[j.a] | bodies.flags[j.b]) & 4)) return;
+    if (m(j.a) > 0 && m(j.b) > 0 && colors[j.a] === colors[j.b]) conflicts++;
+  });
   return verdict(conflicts === 0, { conflicts, contacts: nc });
 }
 
 /**
- * Contact conditions of the last step (RigidWorld): force sign λ_n ≤ 0, isotropic Coulomb cone
- * |λ_t| ≤ μ|λ_n|, bounded penetration, and complementarity |λ_n|·gap ≈ 0 for separated contacts.
+ * Contact conditions of the last step (RigidWorld): force sign λ_n ≤ 0 and the isotropic Coulomb
+ * cone |λ_t| ≤ μ|λ_n| (up to f32 rounding: 1e-6 absolute, coneTol relative), and bounded
+ * penetration. The complementarity |λ_n|·gap of separated contacts is reported as evidence but is
+ * not part of `ok` (speculative contacts legitimately carry force across a small gap).
  * o: { maxPenetration (m, default 0.02), coneTol (default 1e-3 relative) }
  */
 async function checkContacts(world, o = {}) {
@@ -9411,30 +10335,40 @@ async function checkMPM(sim, tol = 1e-4) {
 }
 
 /**
- * Backpropagation against central finite differences on random parameters (an MLP with
- * relu/tanh/sigmoid/none activations, MSE loss on X → T). Returns the worst relative error.
+ * Backpropagation against central finite differences on random parameters — weights and biases
+ * of every layer, each sample drawing the parameter tensor and the index independently (an MLP,
+ * MSE loss on X → T). Returns the worst relative error.
+ * o: { samples (default 16), eps (default 1e-2), tol (default 0.05), seed }
  */
 async function checkGradient(net, X, T, batch, o = {}) {
   const ctx = net.ctx, outN = net.layers[net.layers.length - 1].out;
   const loss = new MSELoss(ctx, batch * outN);
-  const lossAt = async () => { net.forward(X, batch); loss.run(net.output, T, batch * outN); return loss.readLoss(); };
-  net.forward(X, batch);
-  net.backward(loss.run(net.output, T, batch * outN), batch);
-  const samples = o.samples ?? 12, eps = o.eps ?? 1e-2;
-  let worst = 0, s = 12345;
-  for (let q = 0; q < samples; q++) {
-    s = (s * 16807) % 2147483647;
-    const l = net.layers[s % net.layers.length];
-    const W = await l.W.read(), G = await l.gW.read();
-    const idx = s % W.length;
-    const w0 = W[idx];
-    W[idx] = w0 + eps; ctx.flush(); l.W.write(W); const lp = await lossAt();
-    W[idx] = w0 - eps; ctx.flush(); l.W.write(W); const lm = await lossAt();
-    W[idx] = w0; ctx.flush(); l.W.write(W);
-    const fd = (lp - lm) / (2 * eps);
-    worst = Math.max(worst, Math.abs(fd - G[idx]) / Math.max(1e-4, Math.abs(fd), Math.abs(G[idx])));
+  try {
+    const lossAt = async () => { net.forward(X, batch); loss.run(net.output, T, batch * outN); return loss.readLoss(); };
+    net.forward(X, batch);
+    net.backward(loss.run(net.output, T, batch * outN), batch);
+    const params = net.params;   // [{ w, g }] — W and b of every layer
+    const samples = o.samples ?? 16, eps = o.eps ?? 1e-2;
+    let worst = 0, s = (o.seed ?? 12345) >>> 0 || 1;
+    const next = () => { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; return (s >>> 0) / 4294967296; };
+    const seen = new Set();
+    for (let q = 0; q < samples; q++) {
+      const pi = q < params.length ? q : Math.floor(next() * params.length);   // every tensor at least once
+      const P = params[pi];
+      const W = await P.w.read(), G = await P.g.read();
+      const idx = Math.floor(next() * W.length);
+      seen.add(pi);
+      const w0 = W[idx];
+      W[idx] = w0 + eps; ctx.flush(); P.w.write(W); const lp = await lossAt();
+      W[idx] = w0 - eps; ctx.flush(); P.w.write(W); const lm = await lossAt();
+      W[idx] = w0; ctx.flush(); P.w.write(W);
+      const fd = (lp - lm) / (2 * eps);
+      worst = Math.max(worst, Math.abs(fd - G[idx]) / Math.max(1e-4, Math.abs(fd), Math.abs(G[idx])));
+    }
+    return verdict(worst < (o.tol ?? 0.05), { maxRelativeError: worst, samples, tensorsChecked: seen.size, tensors: params.length });
+  } finally {
+    loss.destroy();
   }
-  return verdict(worst < (o.tol ?? 0.05), { maxRelativeError: worst, samples });
 }
 
 /** The same build run twice gives bit-identical state hashes (needs a deterministic RigidWorld). */
@@ -9452,12 +10386,16 @@ async function checkDeterminism(makeWorld, steps = 120, every = 30) {
 /** snapshot → step n → restore → step n reproduces the same state hash. */
 async function checkReplay(world, steps = 60) {
   const snap = world.snapshot();
-  for (let s = 0; s < steps; s++) world.step(1 / 60);
-  const a = await world.hash();
-  world.restore(snap);
-  for (let s = 0; s < steps; s++) world.step(1 / 60);
-  const b = await world.hash();
-  return verdict(a === b, { first: a, replay: b });
+  try {
+    for (let s = 0; s < steps; s++) world.step(1 / 60);
+    const a = await world.hash();
+    world.restore(snap);
+    for (let s = 0; s < steps; s++) world.step(1 / 60);
+    const b = await world.hash();
+    return verdict(a === b, { first: a, replay: b });
+  } finally {
+    destroyAll(snap.B, snap.J, snap.ext, snap.C, snap.tbl, snap.cnt);
+  }
 }
 
 /**
@@ -9467,66 +10405,78 @@ async function checkReplay(world, steps = 60) {
 const LAWS = [
   { name: 'scan', statement: 'Scan.run computes an exclusive prefix sum: s[0] = 0, s[k+1] − s[k] = a[k].', async check(gpu, SI) {
     const n = 1 << 18, a = new Uint32Array(n).map((_, k) => (k * 2654435761) % 1000);
-    const A = gpu.array('u32', a), S = gpu.array('u32', n + 1);
-    new SI.Scan(gpu, n + 1).run(A, S, n);
-    return checkScan(gpu, A, S, n);
+    const A = gpu.array('u32', a), S = gpu.array('u32', n + 1), scan = new SI.Scan(gpu, n + 1);
+    try { scan.run(A, S, n); return await checkScan(gpu, A, S, n); } finally { destroyAll(A, S, scan); }
   } },
   { name: 'gemm', statement: 'gemm computes C = A·B (Freivalds certificate, false-accept probability ≤ 2⁻⁸).', async check(gpu, SI) {
     const M = 777, N = 513, K = 1029;
-    const rnd = (n, s) => { const x = new Float32Array(n); for (let k = 0; k < n; k++) { s = (s * 16807) % 2147483647; x[k] = s / 2147483647 - 0.5; } return x; };
     const A = gpu.array('f32', rnd(M * K, 3)), B = gpu.array('f32', rnd(K * N, 7)), C = gpu.array('f32', M * N);
-    SI.nn.gemm(gpu, A, B, C, { M, N, K });
-    return freivalds(gpu, A, B, C, { M, N, K, trials: 8 });
+    try { SI.nn.gemm(gpu, A, B, C, { M, N, K }); return await freivalds(gpu, A, B, C, { M, N, K, trials: 8 }); } finally { destroyAll(A, B, C); }
   } },
   { name: 'gemm-rejects', statement: 'Freivalds rejects a product with a single corrupted entry.', async check(gpu, SI) {
     const M = 300, N = 200, K = 400;
-    const rnd = (n, s) => { const x = new Float32Array(n); for (let k = 0; k < n; k++) { s = (s * 16807) % 2147483647; x[k] = s / 2147483647 - 0.5; } return x; };
     const A = gpu.array('f32', rnd(M * K, 5)), B = gpu.array('f32', rnd(K * N, 9)), C = gpu.array('f32', M * N);
-    SI.nn.gemm(gpu, A, B, C, { M, N, K });
-    const c = await C.read(); c[12345] += 0.5; gpu.flush(); C.write(c);
-    const r = await freivalds(gpu, A, B, C, { M, N, K, trials: 8 });
-    return verdict(!r.ok, { detected: !r.ok, maxRelative: r.maxRelative });
+    try {
+      SI.nn.gemm(gpu, A, B, C, { M, N, K });
+      const c = await C.read(); c[12345] += 0.5; gpu.flush(); C.write(c);
+      const r = await freivalds(gpu, A, B, C, { M, N, K, trials: 8 });
+      return verdict(!r.ok, { detected: !r.ok, maxRelative: r.maxRelative });
+    } finally { destroyAll(A, B, C); }
   } },
   { name: 'colouring', statement: 'No two dynamic bodies of one colour share a contact or a joint.', async check(gpu) {
     const w = gpu.rigid({ maxBodies: 2048 });
-    let s = 7; const r = () => { s = (s * 16807) % 2147483647; return s / 2147483647; };
-    for (let k = 0; k < 1000; k++) w.addBox({ position: [(r() - 0.5) * 5, 0.3 + k * 0.02, (r() - 0.5) * 5], half: [0.2, 0.2, 0.2], rotation: [r(), r(), r()] });
-    for (let k = 0; k < 120; k++) w.step(1 / 60);
-    return checkColoring(w);
+    try {
+      let s = 7; const r = () => { s = (s * 16807) % 2147483647; return s / 2147483647; };
+      for (let k = 0; k < 1000; k++) w.addBox({ position: [(r() - 0.5) * 5, 0.3 + k * 0.02, (r() - 0.5) * 5], half: [0.2, 0.2, 0.2], rotation: [r(), r(), r()] });
+      for (let k = 0; k < 120; k++) w.step(1 / 60);
+      return await checkColoring(w);
+    } finally { w.destroy(); }
   } },
   { name: 'contacts', statement: 'Contact forces push (λ_n ≤ 0), stay in the Coulomb cone (|λ_t| ≤ μ|λ_n|), and a settled 600-body pile of 20–60 g bodies penetrates less than 2 cm (8 iterations; heavier stacks need substeps).', async check(gpu) {
     const w = gpu.rigid({ maxBodies: 2048 });
-    let s = 9; const r = () => { s = (s * 16807) % 2147483647; return s / 2147483647; };
-    for (let k = 0; k < 600; k++) (r() < 0.5 ? w.addBox({ position: [(r() - 0.5) * 4, 0.3 + k * 0.02, (r() - 0.5) * 4], half: [0.2, 0.15, 0.25], rotation: [r(), r(), r()] })
-      : w.addSphere({ position: [(r() - 0.5) * 4, 0.3 + k * 0.02, (r() - 0.5) * 4], radius: 0.18 }));
-    for (let k = 0; k < 360; k++) w.step(1 / 60);
-    return checkContacts(w, { maxPenetration: 0.02 });
+    try {
+      let s = 9; const r = () => { s = (s * 16807) % 2147483647; return s / 2147483647; };
+      for (let k = 0; k < 600; k++) (r() < 0.5 ? w.addBox({ position: [(r() - 0.5) * 4, 0.3 + k * 0.02, (r() - 0.5) * 4], half: [0.2, 0.15, 0.25], rotation: [r(), r(), r()] })
+        : w.addSphere({ position: [(r() - 0.5) * 4, 0.3 + k * 0.02, (r() - 0.5) * 4], radius: 0.18 }));
+      for (let k = 0; k < 360; k++) w.step(1 / 60);
+      return await checkContacts(w, { maxPenetration: 0.02 });
+    } finally { w.destroy(); }
   } },
   { name: 'determinism', statement: 'A deterministic RigidWorld is a function of its inputs: two runs give bit-identical states.', async check(gpu) {
-    return checkDeterminism(() => {
-      const w = gpu.rigid({ maxBodies: 1024, deterministic: true });
-      for (let k = 0; k < 300; k++) w.addBox({ position: [(k % 7) * 0.45 - 1.5, 0.3 + Math.floor(k / 7) * 0.45, (k % 5) * 0.1], half: [0.2, 0.2, 0.2], rotation: [k * 0.1, k * 0.2, 0] });
-      return w;
-    });
+    const made = [];
+    try {
+      return await checkDeterminism(() => {
+        const w = gpu.rigid({ maxBodies: 1024, deterministic: true });
+        made.push(w);
+        for (let k = 0; k < 300; k++) w.addBox({ position: [(k % 7) * 0.45 - 1.5, 0.3 + Math.floor(k / 7) * 0.45, (k % 5) * 0.1], half: [0.2, 0.2, 0.2], rotation: [k * 0.1, k * 0.2, 0] });
+        return w;
+      });
+    } finally { destroyAll(made); }
   } },
   { name: 'replay', statement: 'restore(snapshot) followed by the same steps reproduces the same state.', async check(gpu) {
     const w = gpu.rigid({ maxBodies: 1024, deterministic: true });
-    for (let k = 0; k < 200; k++) w.addSphere({ position: [(k % 5) * 0.5, 0.5 + Math.floor(k / 5) * 0.5, (k % 3) * 0.3], radius: 0.2 });
-    for (let k = 0; k < 30; k++) w.step(1 / 60);
-    return checkReplay(w, 60);
+    try {
+      for (let k = 0; k < 200; k++) w.addSphere({ position: [(k % 5) * 0.5, 0.5 + Math.floor(k / 5) * 0.5, (k % 3) * 0.3], radius: 0.2 });
+      for (let k = 0; k < 30; k++) w.step(1 / 60);
+      return await checkReplay(w, 60);
+    } finally { w.destroy(); }
   } },
   { name: 'mpm-conservation', statement: 'MLS-MPM P2G conserves mass and momentum exactly (fixed-point sums).', async check(gpu) {
     const sim = gpu.mpm({ grid: 32, maxParticles: 50000 });
-    sim.add({ box: [[0.2, 0.2, 0.2], [0.6, 0.6, 0.6]] }, { material: 'water', velocity: [0.3, 0.1, -0.2] });
-    for (let k = 0; k < 10; k++) sim.step();
-    return checkMPM(sim);
+    try {
+      sim.add({ box: [[0.2, 0.2, 0.2], [0.6, 0.6, 0.6]] }, { material: 'water', velocity: [0.3, 0.1, -0.2] });
+      for (let k = 0; k < 10; k++) sim.step();
+      return await checkMPM(sim);
+    } finally { sim.destroy(); }
   } },
-  { name: 'backprop', statement: 'MLP.backward equals the finite-difference gradient of the MSE loss.', async check(gpu, SI) {
+  { name: 'backprop', statement: 'MLP.backward equals the finite-difference gradient of the MSE loss, for every weight and bias tensor.', async check(gpu, SI) {
     const net = new SI.nn.MLP(gpu, { layers: [3, 16, 16, 2], act: 'tanh', out: 'none', maxBatch: 64, seed: 4 });
     const X = gpu.array('f32', new Float32Array(64 * 3).map((_, k) => Math.sin(k * 0.37))), T = gpu.array('f32', new Float32Array(64 * 2).map((_, k) => Math.cos(k)));
-    return checkGradient(net, X, T, 64);
+    try { return await checkGradient(net, X, T, 64); } finally { destroyAll(net, X, T); }
   } },
 ];
+
+function rnd(n, s) { const x = new Float32Array(n); for (let k = 0; k < n; k++) { s = (s * 16807) % 2147483647; x[k] = s / 2147483647 - 0.5; } return x; }
 
 async function proveAll(gpu, SI, only) {
   const out = [];
@@ -9543,8 +10493,8 @@ return { checkScan, checkSorted, checkPermutation, freivalds, checkColoring, che
 })();
 
 // ---- src/shaders/noise.js
-const __m45 = (() => {
-const defineModule = __m5.defineModule;
+const __m47 = (() => {
+const defineModule = __m6.defineModule;
 
 
 // Procedural noise with analytic derivatives.
@@ -9886,8 +10836,8 @@ return {  };
 })();
 
 // ---- src/shaders/sdf.js
-const __m46 = (() => {
-const defineModule = __m5.defineModule;
+const __m48 = (() => {
+const defineModule = __m6.defineModule;
 
 
 // Signed distance functions. Exact where possible (|∇d| = 1), otherwise a
@@ -10063,8 +11013,8 @@ return {  };
 })();
 
 // ---- src/shaders/raymarch.js
-const __m47 = (() => {
-const defineModule = __m5.defineModule;
+const __m49 = (() => {
+const defineModule = __m6.defineModule;
 
 
 // Sphere tracing for user scenes. The importing shader must define
@@ -10192,8 +11142,8 @@ return {  };
 })();
 
 // ---- src/shaders/color.js
-const __m48 = (() => {
-const defineModule = __m5.defineModule;
+const __m50 = (() => {
+const defineModule = __m6.defineModule;
 
 
 defineModule('color', {
@@ -10375,8 +11325,8 @@ return {  };
 })();
 
 // ---- src/shaders/pbr.js
-const __m49 = (() => {
-const defineModule = __m5.defineModule;
+const __m51 = (() => {
+const defineModule = __m6.defineModule;
 
 
 // Physically based shading: GGX microfacet specular with the height-correlated
@@ -10452,7 +11402,7 @@ return {  };
 })();
 
 // ---- src/shaders/index.js
-const __m44 = (() => {
+const __m46 = (() => {
 // Registers every shader-library module. Import for side effects.
 return {  };
 })();
@@ -10460,65 +11410,67 @@ return {  };
 // ---- src/index.js
 const __m0 = (() => {
 const init = __m1.init;
+const isSupported = __m1.isSupported;
 const Context = __m1.Context;
 const SIError = __m1.SIError;
 const GArray = __m2.GArray;
-const Kernel = __m4.Kernel;
-const defineModule = __m5.defineModule;
-const link = __m5.link;
-const moduleNames = __m5.moduleNames;
-const moduleInfo = __m5.moduleInfo;
-const literal = __m5.literal;
+const Kernel = __m5.Kernel;
+const defineModule = __m6.defineModule;
+const link = __m6.link;
+const moduleNames = __m6.moduleNames;
+const moduleInfo = __m6.moduleInfo;
+const literal = __m6.literal;
 const layoutOf = __m3.layoutOf;
 const structLayout = __m3.structLayout;
 const toHalf = __m3.toHalf;
 const fromHalf = __m3.fromHalf;
-const Scan = __m7.Scan;
-const Reduce = __m8.Reduce;
-const SpatialGrid = __m9.SpatialGrid;
-const View = __m10.View;
-const OrbitCamera = __m10.OrbitCamera;
-const Hud = __m10.Hud;
-const RenderProgram = __m11.RenderProgram;
-const Fullscreen = __m14.Fullscreen;
-const Spheres = __m15.Spheres;
-const m4 = __m13.m4;
-const v3 = __m13.v3;
-const Stage = __m16.Stage;
-const Lines = __m16.Lines;
-const panel = __m17.panel;
-const MPM = __m18.MPM;
-const MATERIALS = __m18.MATERIALS;
-const NBody = __m25.NBody;
-const timeIt = __m25.timeIt;
-const Points = __m26.Points;
-const Bloom = __m12.Bloom;
-const SdfScene = __m27.SdfScene;
-const Glyphs = __m28.Glyphs;
-const Boids = __m29.Boids;
-const Cloth = __m30.Cloth;
-const SurfaceMesh = __m31.SurfaceMesh;
-const Smoke = __m32.Smoke;
-const Volume = __m33.Volume;
-const FluidSurface = __m19.FluidSurface;
-const RigidWorld = __m34.RigidWorld;
-const RayQuery = __m34.RayQuery;
-const eulerQuat = __m34.eulerQuat;
-const RIGID_SHAPES = __m34.RIGID_SHAPES;
-const RIGID_FLAGS = __m34.RIGID_FLAGS;
-const JOINT_TYPES = __m34.JOINT_TYPES;
-const JOINT_FLAGS = __m34.JOINT_FLAGS;
-const Bodies = __m35.Bodies;
-const FluidRigidCoupling = __m20.FluidRigidCoupling;
-const gemm = __m36.gemm;
-const autotuneGemm = __m36.autotuneGemm;
-const MLP = __m36.MLP;
-const Adam = __m36.Adam;
-const Population = __m36.Population;
-const three = __m39;
-const nn = __m36;
-const net = __m40;
-const verify = __m43;
+const Scan = __m8.Scan;
+const Reduce = __m10.Reduce;
+const SpatialGrid = __m11.SpatialGrid;
+const View = __m12.View;
+const OrbitCamera = __m12.OrbitCamera;
+const Hud = __m12.Hud;
+const RenderProgram = __m13.RenderProgram;
+const Fullscreen = __m16.Fullscreen;
+const Spheres = __m17.Spheres;
+const m4 = __m15.m4;
+const v3 = __m15.v3;
+const Stage = __m18.Stage;
+const Lines = __m18.Lines;
+const panel = __m19.panel;
+const MPM = __m20.MPM;
+const MATERIALS = __m20.MATERIALS;
+const MPM_KINDS = __m20.MPM_KINDS;
+const NBody = __m27.NBody;
+const timeIt = __m27.timeIt;
+const Points = __m28.Points;
+const Bloom = __m14.Bloom;
+const SdfScene = __m29.SdfScene;
+const Glyphs = __m30.Glyphs;
+const Boids = __m31.Boids;
+const Cloth = __m32.Cloth;
+const SurfaceMesh = __m33.SurfaceMesh;
+const Smoke = __m34.Smoke;
+const Volume = __m35.Volume;
+const FluidSurface = __m21.FluidSurface;
+const RigidWorld = __m36.RigidWorld;
+const RayQuery = __m36.RayQuery;
+const eulerQuat = __m36.eulerQuat;
+const RIGID_SHAPES = __m36.RIGID_SHAPES;
+const RIGID_FLAGS = __m36.RIGID_FLAGS;
+const JOINT_TYPES = __m36.JOINT_TYPES;
+const JOINT_FLAGS = __m36.JOINT_FLAGS;
+const Bodies = __m37.Bodies;
+const FluidRigidCoupling = __m22.FluidRigidCoupling;
+const gemm = __m38.gemm;
+const autotuneGemm = __m38.autotuneGemm;
+const MLP = __m38.MLP;
+const Adam = __m38.Adam;
+const Population = __m38.Population;
+const three = __m41;
+const nn = __m38;
+const net = __m42;
+const verify = __m45;
 // ShaderIntel — WebGPU physics + shader library.
 //
 //   import * as SI from './src/index.js';
@@ -10607,7 +11559,7 @@ Object.assign(Context.prototype, {
   spheres(opts) { return new Spheres(this, opts); },
   mpm(opts) { return new MPM(this, opts); },
 });
-return { init, Context, SIError, GArray, Kernel, defineModule, link, moduleNames, moduleInfo, literal, layoutOf, structLayout, toHalf, fromHalf, Scan, Reduce, SpatialGrid, View, OrbitCamera, Hud, RenderProgram, Fullscreen, Spheres, m4, v3, Stage, Lines, panel, MPM, MATERIALS, NBody, timeIt, Points, Bloom, SdfScene, Glyphs, Boids, Cloth, SurfaceMesh, Smoke, Volume, FluidSurface, RigidWorld, RayQuery, eulerQuat, RIGID_SHAPES, RIGID_FLAGS, JOINT_TYPES, JOINT_FLAGS, Bodies, FluidRigidCoupling, gemm, autotuneGemm, MLP, Adam, Population, three, nn, net, verify };
+return { init, isSupported, Context, SIError, GArray, Kernel, defineModule, link, moduleNames, moduleInfo, literal, layoutOf, structLayout, toHalf, fromHalf, Scan, Reduce, SpatialGrid, View, OrbitCamera, Hud, RenderProgram, Fullscreen, Spheres, m4, v3, Stage, Lines, panel, MPM, MATERIALS, MPM_KINDS, NBody, timeIt, Points, Bloom, SdfScene, Glyphs, Boids, Cloth, SurfaceMesh, Smoke, Volume, FluidSurface, RigidWorld, RayQuery, eulerQuat, RIGID_SHAPES, RIGID_FLAGS, JOINT_TYPES, JOINT_FLAGS, Bodies, FluidRigidCoupling, gemm, autotuneGemm, MLP, Adam, Population, three, nn, net, verify };
 })();
 
 global.SI = __m0;

@@ -1,6 +1,7 @@
 // WGSL host-shareable type layout (WGSL spec §14.4 "Memory Layout").
 // Every size/alignment here is what the GPU expects, so JS can pack data
 // byte-exactly without guessing.
+import { SIError } from './errors.js';
 
 const SCALARS = {
   f32: { size: 4, align: 4, array: Float32Array },
@@ -50,7 +51,7 @@ export function layoutOf(type) {
       components: cols * rows, cols, rows, colStride, stride: cols * colStride,
     };
   }
-  throw new Error(`ShaderIntel: unsupported WGSL type "${type}"`);
+  throw new SIError(`ShaderIntel: unsupported WGSL type "${type}"`);
 }
 
 export const roundUp = (x, a) => Math.ceil(x / a) * a;

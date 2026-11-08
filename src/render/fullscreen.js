@@ -19,7 +19,9 @@ export class Fullscreen {
       name: desc.name || 'fullscreen',
       imports: desc.imports, uniforms: desc.uniforms, textures: desc.textures, samplers: desc.samplers,
       buffers: desc.buffers, defines: desc.defines, values: desc.values,
-      depth: { write: !!desc.writeDepth, compare: 'always' },
+      // 'always' draws over what earlier layers drew (a background layer goes first); a layer that
+      // writes real depth can pass depthCompare: 'less-equal' to be order-independent
+      depth: { write: !!desc.writeDepth, compare: desc.depthCompare || 'always' },
       targets: desc.targets,
       code: /* wgsl */`
         struct FsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f }
@@ -49,4 +51,6 @@ export class Fullscreen {
   set(values) { this.program.set(values); return this; }
   bind(resources) { this.program.bind(resources); return this; }
   draw(pass, view) { this.program.draw(pass, view, 3, 1); }
+  /** Layers own no GPU memory beyond their pipeline (garbage-collected); kept for a uniform API. */
+  destroy() { this.destroyed = true; }
 }
